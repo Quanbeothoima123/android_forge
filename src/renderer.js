@@ -52,9 +52,8 @@ async function refreshDevices() {
     if (current && online.some((d) => d.deviceId === current))
       selEl.value = current;
 
-    if (!online.length) {
+    if (!online.length)
       selEl.innerHTML = `<option value="">(Không có thiết bị ONLINE)</option>`;
-    }
   } catch (e) {
     listEl.innerHTML = `<li class="err">Lỗi: ${e.message}</li>`;
   }
@@ -81,7 +80,6 @@ function mustHaveResolution(d) {
   return d.resolution;
 }
 
-// ====== Core1 buttons ======
 async function tapCenter() {
   const deviceId = getSelectedDeviceId();
   await ensureAgent(deviceId);
@@ -167,176 +165,89 @@ async function tapXY() {
   log(`Tap X,Y on ${deviceId} at ${x},${y}`);
 }
 
-async function back() {
+async function backAction() {
   const deviceId = getSelectedDeviceId();
   await ensureAgent(deviceId);
   await window.forgeAPI.back(deviceId);
   log(`Back on ${deviceId}`);
 }
 
-async function home() {
+async function homeAction() {
   const deviceId = getSelectedDeviceId();
   await ensureAgent(deviceId);
   await window.forgeAPI.home(deviceId);
   log(`Home on ${deviceId}`);
 }
 
-// ====== Core2: stream + canvas interaction ======
-const canvas = $("screenCanvas");
-const ctx2d = canvas.getContext("2d");
+// ===== STREAM (capture scrcpy window) =====
+let currentStream = null;
 
-let ws = null;
-let streamingDeviceId = null;
-let lastFrameBitmap = null;
-
-// để mapping: cần resolution thật của device
-let deviceRes = null;
-
-function fitCanvasToAspect(res) {
-  // giữ size canvas vừa phải (UI), nhưng aspect theo device
-  const maxW = 360;
-  const aspect = res.height / res.width;
-  canvas.width = maxW;
-  canvas.height = Math.floor(maxW * aspect);
+async function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
-function drawFrameFromBlob(blob) {
-  // decode JPEG frame -> vẽ canvas
-  createImageBitmap(blob)
-    .then((bmp) => {
-      if (lastFrameBitmap) lastFrameBitmap.close?.();
-      lastFrameBitmap = bmp;
-      ctx2d.drawImage(bmp, 0, 0, canvas.width, canvas.height);
-    })
-    .catch(() => {});
-}
-
-async function streamStart() {
-  const deviceId = getSelectedDeviceId();
-  await ensureAgent(deviceId);
-
-  const snap = await getSelectedDeviceSnapshot(deviceId);
-  deviceRes = mustHaveResolution(snap);
-  fitCanvasToAspect(deviceRes);
-
-  const { url } = await window.forgeAPI.streamStart(deviceId);
-
-  if (ws) {
-    try {
-      ws.close();
-    } catch {}
-    ws = null;
+async function waitForSourceIdByTitleContains(needle, timeoutMs = 10000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    const id = await window.forgeAPI.getWindowSourceIdByTitleContains(needle);
+    if (id) return id;
+    await sleep(250);
   }
+  throw new Error(`Không tìm thấy window scrcpy với title chứa "${needle}"`);
+}
 
-  ws = new WebSocket(url);
-  ws.binaryType = "arraybuffer";
-  streamingDeviceId = deviceId;
-
-  ws.onopen = () => log(`Stream started for ${deviceId}`);
-  ws.onerror = () => log(`Stream WS error`, true);
-  ws.onclose = () => log(`Stream closed for ${deviceId}`, true);
-
-  ws.onmessage = (ev) => {
-    const buf = ev.data; // ArrayBuffer
-    const blob = new Blob([buf], { type: "image/jpeg" });
-    drawFrameFromBlob(blob);
+async function attachWindowToVideo(sourceId) {
+  const constraints = {
+    audio: false,
+    video: {
+      mandatory: {
+        chromeMediaSource: "desktop",
+        chromeMediaSourceId: sourceId,
+      },
+    },
   };
+
+  const stream = await navigator.mediaDevices.getUserMedia(constraints);
+  const video = $("liveVideo");
+  video.srcObject = stream;
+  await video.play();
+  return stream;
 }
 
-async function streamStop() {
-  const deviceId = streamingDeviceId || getSelectedDeviceId();
-  try {
-    await window.forgeAPI.streamStop(deviceId);
-  } catch {}
+async function startStream() {
+  const deviceId = getSelectedDeviceId();
 
-  if (ws) {
+  // start scrcpy GUI (main process)
+  await window.forgeAPI.streamStart(deviceId);
+  log(`Stream start requested for ${deviceId}`);
+
+  const needle = `forge:${deviceId}`;
+  const sourceId = await waitForSourceIdByTitleContains(needle, 12000);
+
+  if (currentStream) {
     try {
-      ws.close();
+      currentStream.getTracks().forEach((t) => t.stop());
     } catch {}
-    ws = null;
+    currentStream = null;
   }
-  streamingDeviceId = null;
-  log(`Stream stopped`);
+
+  currentStream = await attachWindowToVideo(sourceId);
+  log(`Captured scrcpy window for ${deviceId}`);
 }
 
-function canvasToDeviceXY(ev) {
-  if (!deviceRes) throw new Error("Chưa có device resolution");
-  const rect = canvas.getBoundingClientRect();
-  const x = ev.clientX - rect.left;
-  const y = ev.clientY - rect.top;
+async function stopStream() {
+  const deviceId = getSelectedDeviceId();
 
-  const rx = x / rect.width;
-  const ry = y / rect.height;
-
-  const dx = Math.max(
-    0,
-    Math.min(deviceRes.width - 1, Math.round(rx * deviceRes.width))
-  );
-  const dy = Math.max(
-    0,
-    Math.min(deviceRes.height - 1, Math.round(ry * deviceRes.height))
-  );
-  return { x: dx, y: dy };
-}
-
-// drag -> swipe
-let dragging = false;
-let dragStart = null;
-
-function wireCanvasInteraction() {
-  canvas.addEventListener("mousedown", (ev) => {
-    dragging = true;
-    dragStart = canvasToDeviceXY(ev);
-  });
-
-  window.addEventListener("mouseup", async (ev) => {
-    if (!dragging) return;
-    dragging = false;
-
+  if (currentStream) {
     try {
-      const deviceId = getSelectedDeviceId();
-      await ensureAgent(deviceId);
+      currentStream.getTracks().forEach((t) => t.stop());
+    } catch {}
+    currentStream = null;
+  }
+  $("liveVideo").srcObject = null;
 
-      const end = canvasToDeviceXY(ev);
-
-      const dx = Math.abs(end.x - dragStart.x);
-      const dy = Math.abs(end.y - dragStart.y);
-
-      // nếu kéo rất ngắn -> coi như tap
-      if (dx < 10 && dy < 10) {
-        await window.forgeAPI.tap(deviceId, dragStart.x, dragStart.y);
-        log(`Canvas tap ${dragStart.x},${dragStart.y}`);
-        return;
-      }
-
-      await window.forgeAPI.swipe(
-        deviceId,
-        dragStart.x,
-        dragStart.y,
-        end.x,
-        end.y,
-        220
-      );
-      log(`Canvas swipe ${dragStart.x},${dragStart.y} -> ${end.x},${end.y}`);
-    } catch (e) {
-      log(e.message, true);
-    } finally {
-      dragStart = null;
-    }
-  });
-
-  // click trực tiếp (fallback nếu không drag)
-  canvas.addEventListener("dblclick", async (ev) => {
-    try {
-      const deviceId = getSelectedDeviceId();
-      await ensureAgent(deviceId);
-      const p = canvasToDeviceXY(ev);
-      await window.forgeAPI.tap(deviceId, p.x, p.y);
-      log(`Canvas dblclick tap ${p.x},${p.y}`);
-    } catch (e) {
-      log(e.message, true);
-    }
-  });
+  await window.forgeAPI.streamStop(deviceId);
+  log(`Stream stopped for ${deviceId}`);
 }
 
 function wireUI() {
@@ -382,7 +293,7 @@ function wireUI() {
 
   $("backBtn").addEventListener("click", async () => {
     try {
-      await back();
+      await backAction();
     } catch (e) {
       log(e.message, true);
     }
@@ -390,7 +301,7 @@ function wireUI() {
 
   $("homeBtn").addEventListener("click", async () => {
     try {
-      await home();
+      await homeAction();
     } catch (e) {
       log(e.message, true);
     }
@@ -400,17 +311,17 @@ function wireUI() {
     if (ev.key === "Enter") $("tapXYBtn").click();
   });
 
-  $("streamStartBtn").addEventListener("click", async () => {
+  $("startStreamBtn").addEventListener("click", async () => {
     try {
-      await streamStart();
+      await startStream();
     } catch (e) {
       log(e.message, true);
     }
   });
 
-  $("streamStopBtn").addEventListener("click", async () => {
+  $("stopStreamBtn").addEventListener("click", async () => {
     try {
-      await streamStop();
+      await stopStream();
     } catch (e) {
       log(e.message, true);
     }
@@ -418,6 +329,5 @@ function wireUI() {
 }
 
 wireUI();
-wireCanvasInteraction();
 refreshDevices();
 setInterval(refreshDevices, 1500);

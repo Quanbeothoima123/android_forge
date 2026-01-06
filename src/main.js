@@ -1,8 +1,8 @@
-const { app, BrowserWindow, ipcMain } = require("electron");
+const { app, BrowserWindow, ipcMain, desktopCapturer } = require("electron");
 const path = require("path");
 
 const { DeviceRegistry } = require("./controller/deviceRegistry");
-const { StreamManager } = require("./controller/streamManager");
+const { scrcpy } = require("./controller/scrcpyController");
 const {
   ping,
   tap,
@@ -17,7 +17,6 @@ if (require("electron-squirrel-startup")) {
 }
 
 const registry = new DeviceRegistry();
-const streams = new StreamManager();
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -86,24 +85,36 @@ app.whenReady().then(() => {
     );
   });
 
-  // ========== CORE 2: STREAM ==========
-  ipcMain.handle("stream:start", async (_, { deviceId }) => {
-    const ctx = ensureOnline(registry.get(deviceId));
-    // stream không “enqueue” vì scrcpy không dùng adb sau khi chạy.
-    // nhưng vẫn cần ping agent để chắc device đang ok.
-    await ctx.enqueue(() => ping(deviceId));
-    const url = await streams.start(deviceId, { maxFps: 30, bitRate: "8M" });
-    return { url };
-  });
+  // ===== CORE 2 (GUI scrcpy + desktopCapturer capture window) =====
 
-  ipcMain.handle("stream:stop", async (_, { deviceId }) => {
-    streams.stop(deviceId);
+  ipcMain.handle("device:streamStart", async (_, { deviceId }) => {
+    const ctx = ensureOnline(registry.get(deviceId));
+    // đảm bảo device thật vẫn ok
+    await ctx.enqueue(() => ping(deviceId));
+
+    // start GUI scrcpy với title cố định để capture
+    scrcpy.start(deviceId);
     return true;
   });
 
-  ipcMain.handle("stream:url", async (_, { deviceId }) => {
-    if (!streams.isRunning(deviceId)) throw new Error("Stream not running");
-    return { url: streams.getWsUrl(deviceId) };
+  ipcMain.handle("device:streamStop", async (_, { deviceId }) => {
+    scrcpy.stop(deviceId);
+    return true;
+  });
+
+  ipcMain.handle("device:streamIsRunning", async (_, { deviceId }) => {
+    return scrcpy.isRunning(deviceId);
+  });
+
+  // renderer KHÔNG require electron được, nên expose API tìm sourceId từ main
+  ipcMain.handle("stream:listWindowSources", async () => {
+    const sources = await desktopCapturer.getSources({
+      types: ["window"],
+      fetchWindowIcons: false,
+    });
+
+    // trả nhẹ: id + name
+    return sources.map((s) => ({ id: s.id, name: s.name }));
   });
 
   createWindow();
@@ -115,6 +126,6 @@ app.whenReady().then(() => {
 
 app.on("window-all-closed", () => {
   registry.stopPolling();
-  streams.stopAll();
+  scrcpy.stopAll();
   if (process.platform !== "darwin") app.quit();
 });

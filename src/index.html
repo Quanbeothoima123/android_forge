@@ -1,0 +1,140 @@
+<!doctype html>
+<html>
+
+<head>
+    <meta charset="UTF-8" />
+    <title>Android Forge</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 16px;
+        }
+
+        .row {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        select,
+        button,
+        input {
+            padding: 6px 10px;
+        }
+
+        input {
+            width: 110px;
+        }
+
+        .muted {
+            color: #666;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            margin-top: 16px;
+        }
+
+        .card {
+            border: 1px solid #ddd;
+            padding: 12px;
+            border-radius: 8px;
+        }
+
+        ul {
+            margin-top: 8px;
+        }
+
+        .err {
+            color: #b00020;
+        }
+
+        code {
+            background: #f5f5f5;
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+
+        .mini {
+            font-size: 12px;
+        }
+
+        .previewWrap {
+            margin-top: 12px;
+            display: flex;
+            gap: 16px;
+            align-items: flex-start;
+            flex-wrap: wrap;
+        }
+
+        canvas {
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            background: #000;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Android Forge</h1>
+
+    <div class="row">
+        <label>Chọn thiết bị:</label>
+        <select id="deviceSelect"></select>
+
+        <button id="tapCenterBtn">Tap Center</button>
+        <button id="longPressCenterBtn">Long Press Center</button>
+
+        <button id="swipeUpBtn">Swipe Up</button>
+        <button id="swipeDownBtn">Swipe Down</button>
+
+        <button id="backBtn">Back</button>
+        <button id="homeBtn">Home</button>
+
+        <span class="muted">Tip: nếu Agent chưa READY, bật Accessibility của AndroidForgeAgent.</span>
+    </div>
+
+    <div class="row" style="margin-top: 12px;">
+        <strong>Tap theo tọa độ:</strong>
+        <label>X</label>
+        <input id="xInput" type="number" placeholder="x (px)" />
+        <label>Y</label>
+        <input id="yInput" type="number" placeholder="y (px)" />
+        <button id="tapXYBtn">Tap X,Y</button>
+        <span class="muted mini">(tọa độ px theo resolution của máy — xem ở danh sách Devices)</span>
+    </div>
+
+    <div class="previewWrap">
+        <div class="card">
+            <div class="row">
+                <strong>Live Screen</strong>
+                <button id="streamStartBtn">Start Stream</button>
+                <button id="streamStopBtn">Stop Stream</button>
+                <span class="muted mini">Click để tap — kéo để swipe</span>
+            </div>
+            <div style="margin-top:10px;">
+                <canvas id="screenCanvas" width="360" height="800"></canvas>
+            </div>
+            <div class="muted mini" style="margin-top:8px;">
+                Mapping: canvas → tọa độ Android theo tỉ lệ (không phụ thuộc kích thước canvas).
+            </div>
+        </div>
+
+        <div class="card" style="min-width:420px;">
+            <h2>Devices</h2>
+            <ul id="devices"></ul>
+        </div>
+
+        <div class="card" style="min-width:420px;">
+            <h2>Log</h2>
+            <div id="log" class="muted">(log sẽ hiện ở đây)</div>
+        </div>
+    </div>
+
+    <script src="./renderer.js"></script>
+</body>
+
+</html>

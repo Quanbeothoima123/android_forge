@@ -52,8 +52,9 @@ async function refreshDevices() {
     if (current && online.some((d) => d.deviceId === current))
       selEl.value = current;
 
-    if (!online.length)
+    if (!online.length) {
       selEl.innerHTML = `<option value="">(Không có thiết bị ONLINE)</option>`;
+    }
   } catch (e) {
     listEl.innerHTML = `<li class="err">Lỗi: ${e.message}</li>`;
   }
@@ -80,6 +81,7 @@ function mustHaveResolution(d) {
   return d.resolution;
 }
 
+// ===== Core1 buttons =====
 async function tapCenter() {
   const deviceId = getSelectedDeviceId();
   await ensureAgent(deviceId);
@@ -165,38 +167,47 @@ async function tapXY() {
   log(`Tap X,Y on ${deviceId} at ${x},${y}`);
 }
 
-async function backAction() {
+async function backBtn() {
   const deviceId = getSelectedDeviceId();
   await ensureAgent(deviceId);
   await window.forgeAPI.back(deviceId);
   log(`Back on ${deviceId}`);
 }
 
-async function homeAction() {
+async function homeBtn() {
   const deviceId = getSelectedDeviceId();
   await ensureAgent(deviceId);
   await window.forgeAPI.home(deviceId);
   log(`Home on ${deviceId}`);
 }
 
-// ===== STREAM (capture scrcpy window) =====
-let currentStream = null;
+// ===== STREAM via desktop capture =====
+let currentCaptureStream = null;
+let streamingDeviceId = null;
+let deviceRes = null;
 
-async function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+function showOverlay(text) {
+  $("overlayText").innerText = text;
+  $("overlay").style.display = "flex";
 }
 
-async function waitForSourceIdByTitleContains(needle, timeoutMs = 10000) {
+function hideOverlay() {
+  $("overlay").style.display = "none";
+}
+
+async function waitForWindowSourceId(deviceId, timeoutMs = 10000) {
+  const needle = `forge:${deviceId}`;
   const t0 = Date.now();
+
   while (Date.now() - t0 < timeoutMs) {
     const id = await window.forgeAPI.getWindowSourceIdByTitleContains(needle);
     if (id) return id;
-    await sleep(250);
+    await new Promise((r) => setTimeout(r, 250));
   }
-  throw new Error(`Không tìm thấy window scrcpy với title chứa "${needle}"`);
+  return null;
 }
 
-async function attachWindowToVideo(sourceId) {
+async function attachCaptureToVideo(sourceId) {
   const constraints = {
     audio: false,
     video: {
@@ -209,45 +220,195 @@ async function attachWindowToVideo(sourceId) {
 
   const stream = await navigator.mediaDevices.getUserMedia(constraints);
   const video = $("liveVideo");
+
+  // cleanup old
+  if (currentCaptureStream) {
+    try {
+      currentCaptureStream.getTracks().forEach((t) => t.stop());
+    } catch {}
+    currentCaptureStream = null;
+  }
+
   video.srcObject = stream;
   await video.play();
-  return stream;
+
+  // detect end
+  const track = stream.getVideoTracks()[0];
+  if (track) {
+    track.onended = () => {
+      log("Capture ended (window closed/minimized)", true);
+      showOverlay("Stream ended (cửa sổ scrcpy bị đóng hoặc capture bị dừng).");
+    };
+  }
+
+  currentCaptureStream = stream;
+  return true;
 }
 
 async function startStream() {
   const deviceId = getSelectedDeviceId();
+  streamingDeviceId = deviceId;
 
-  // start scrcpy GUI (main process)
+  hideOverlay();
+
+  await ensureAgent(deviceId);
+
+  const snap = await getSelectedDeviceSnapshot(deviceId);
+  deviceRes = mustHaveResolution(snap);
+
   await window.forgeAPI.streamStart(deviceId);
   log(`Stream start requested for ${deviceId}`);
 
-  const needle = `forge:${deviceId}`;
-  const sourceId = await waitForSourceIdByTitleContains(needle, 12000);
-
-  if (currentStream) {
-    try {
-      currentStream.getTracks().forEach((t) => t.stop());
-    } catch {}
-    currentStream = null;
+  const sourceId = await waitForWindowSourceId(deviceId, 12000);
+  if (!sourceId) {
+    showOverlay(
+      `Không tìm thấy cửa sổ scrcpy (forge:${deviceId}). Hãy bấm Start Stream lại.`
+    );
+    throw new Error(
+      `Không tìm thấy window scrcpy với title chứa "forge:${deviceId}"`
+    );
   }
 
-  currentStream = await attachWindowToVideo(sourceId);
+  await attachCaptureToVideo(sourceId);
   log(`Captured scrcpy window for ${deviceId}`);
 }
 
 async function stopStream() {
-  const deviceId = getSelectedDeviceId();
+  const deviceId = streamingDeviceId || getSelectedDeviceId();
 
-  if (currentStream) {
+  try {
+    await window.forgeAPI.streamStop(deviceId);
+  } catch {}
+
+  if (currentCaptureStream) {
     try {
-      currentStream.getTracks().forEach((t) => t.stop());
+      currentCaptureStream.getTracks().forEach((t) => t.stop());
     } catch {}
-    currentStream = null;
+    currentCaptureStream = null;
   }
-  $("liveVideo").srcObject = null;
 
-  await window.forgeAPI.streamStop(deviceId);
-  log(`Stream stopped for ${deviceId}`);
+  $("liveVideo").srcObject = null;
+  streamingDeviceId = null;
+
+  showOverlay("Stream stopped.");
+  log(`Stream stopped`);
+}
+
+// ===== mapping click/drag trên video (letterbox aware) =====
+function getVideoContentRect(videoEl) {
+  const rect = videoEl.getBoundingClientRect();
+
+  const vw = videoEl.videoWidth || 0;
+  const vh = videoEl.videoHeight || 0;
+
+  if (!vw || !vh) return null;
+
+  const containerW = rect.width;
+  const containerH = rect.height;
+
+  const scale = Math.min(containerW / vw, containerH / vh);
+  const drawW = vw * scale;
+  const drawH = vh * scale;
+
+  const offsetX = (containerW - drawW) / 2;
+  const offsetY = (containerH - drawH) / 2;
+
+  return {
+    left: rect.left + offsetX,
+    top: rect.top + offsetY,
+    width: drawW,
+    height: drawH,
+    vw,
+    vh,
+  };
+}
+
+function clientToDeviceXY(ev) {
+  if (!deviceRes) throw new Error("Chưa có device resolution");
+  const video = $("liveVideo");
+  const r = getVideoContentRect(video);
+  if (!r) throw new Error("Chưa có frame video (đợi 1-2s)");
+
+  const cx = ev.clientX;
+  const cy = ev.clientY;
+
+  // nếu click vào vùng letterbox (đen) thì ignore
+  if (
+    cx < r.left ||
+    cx > r.left + r.width ||
+    cy < r.top ||
+    cy > r.top + r.height
+  ) {
+    return null;
+  }
+
+  const rx = (cx - r.left) / r.width;
+  const ry = (cy - r.top) / r.height;
+
+  const dx = Math.max(
+    0,
+    Math.min(deviceRes.width - 1, Math.round(rx * deviceRes.width))
+  );
+  const dy = Math.max(
+    0,
+    Math.min(deviceRes.height - 1, Math.round(ry * deviceRes.height))
+  );
+
+  return { x: dx, y: dy, rx, ry };
+}
+
+let dragging = false;
+let dragStart = null;
+
+function wireLiveInteraction() {
+  const video = $("liveVideo");
+
+  video.addEventListener("mousedown", (ev) => {
+    const p = clientToDeviceXY(ev);
+    if (!p) return;
+    dragging = true;
+    dragStart = p;
+  });
+
+  window.addEventListener("mouseup", async (ev) => {
+    if (!dragging) return;
+    dragging = false;
+
+    try {
+      const deviceId = getSelectedDeviceId();
+      await ensureAgent(deviceId);
+
+      const end = clientToDeviceXY(ev);
+      if (!end) return;
+
+      const dx = Math.abs(end.x - dragStart.x);
+      const dy = Math.abs(end.y - dragStart.y);
+
+      if (dx < 10 && dy < 10) {
+        await window.forgeAPI.tap(deviceId, dragStart.x, dragStart.y);
+        log(
+          `Tap from LiveScreen ${Math.round(dragStart.rx * 100)}%,${Math.round(dragStart.ry * 100)}%`
+        );
+        return;
+      }
+
+      await window.forgeAPI.swipe(
+        deviceId,
+        dragStart.x,
+        dragStart.y,
+        end.x,
+        end.y,
+        220
+      );
+      log(
+        `Swipe from LiveScreen ${Math.round(dragStart.rx * 100)}%,${Math.round(dragStart.ry * 100)}% -> ${Math.round(end.rx * 100)}%,${Math.round(end.ry * 100)}%`
+      );
+    } catch (e) {
+      log(e.message, true);
+    } finally {
+      dragStart = null;
+    }
+  });
 }
 
 function wireUI() {
@@ -293,7 +454,7 @@ function wireUI() {
 
   $("backBtn").addEventListener("click", async () => {
     try {
-      await backAction();
+      await backBtn();
     } catch (e) {
       log(e.message, true);
     }
@@ -301,7 +462,7 @@ function wireUI() {
 
   $("homeBtn").addEventListener("click", async () => {
     try {
-      await homeAction();
+      await homeBtn();
     } catch (e) {
       log(e.message, true);
     }
@@ -316,6 +477,7 @@ function wireUI() {
       await startStream();
     } catch (e) {
       log(e.message, true);
+      showOverlay(e.message);
     }
   });
 
@@ -326,8 +488,31 @@ function wireUI() {
       log(e.message, true);
     }
   });
+
+  $("overlayStartBtn").addEventListener("click", async () => {
+    try {
+      await startStream();
+    } catch (e) {
+      log(e.message, true);
+      showOverlay(e.message);
+    }
+  });
+
+  // scrcpy closed -> show overlay
+  window.forgeAPI.onStreamEnded(({ deviceId }) => {
+    if (streamingDeviceId && deviceId === streamingDeviceId) {
+      log(`scrcpy closed for ${deviceId}`, true);
+      showOverlay(
+        "Stream ended (scrcpy đã bị đóng). Bấm Start Stream để chạy lại."
+      );
+    }
+  });
 }
 
 wireUI();
+wireLiveInteraction();
 refreshDevices();
 setInterval(refreshDevices, 1500);
+
+// startup overlay
+showOverlay("Chưa stream. Bấm Start Stream.");

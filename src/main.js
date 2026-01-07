@@ -18,6 +18,8 @@ if (require("electron-squirrel-startup")) {
 
 const registry = new DeviceRegistry();
 
+let mainWindow = null;
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1200,
@@ -30,6 +32,7 @@ function createWindow() {
   });
 
   win.loadFile(path.join(__dirname, "index.html"));
+  return win;
 }
 
 function ensureOnline(ctx) {
@@ -40,7 +43,19 @@ function ensureOnline(ctx) {
 }
 
 app.whenReady().then(() => {
+  mainWindow = createWindow();
+
   registry.startPolling(1500);
+
+  // forward scrcpy close events -> renderer
+  scrcpy.on("closed", ({ deviceId, code, signal }) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.webContents.send("stream:ended", {
+      deviceId,
+      code,
+      signal,
+    });
+  });
 
   ipcMain.handle("devices:list", async () => registry.listSnapshots());
 
@@ -85,42 +100,52 @@ app.whenReady().then(() => {
     );
   });
 
-  // ===== CORE 2 (GUI scrcpy + desktopCapturer capture window) =====
-
-  ipcMain.handle("device:streamStart", async (_, { deviceId }) => {
+  // ===== STREAM: start/stop scrcpy GUI =====
+  ipcMain.handle("stream:start", async (_, { deviceId }) => {
     const ctx = ensureOnline(registry.get(deviceId));
-    // đảm bảo device thật vẫn ok
     await ctx.enqueue(() => ping(deviceId));
 
-    // start GUI scrcpy với title cố định để capture
-    scrcpy.start(deviceId);
-    return true;
+    // IMPORTANT: keep GUI, but move it to corner + small size (not minimized)
+    scrcpy.start(deviceId, {
+      maxFps: 30,
+      bitRate: "8M",
+      // tránh port đụng agent
+      portRange: "27200:27299",
+      // đưa cửa sổ vào góc + nhỏ
+      moveWindow: {
+        // bạn có thể chỉnh lại tùy màn hình
+        width: 260,
+        height: 580,
+        // -1 nghĩa là tự tính góc phải dưới theo màn hình chính
+        x: -1,
+        y: -1,
+        margin: 10,
+      },
+    });
+
+    return { ok: true };
   });
 
-  ipcMain.handle("device:streamStop", async (_, { deviceId }) => {
+  ipcMain.handle("stream:stop", async (_, { deviceId }) => {
     scrcpy.stop(deviceId);
     return true;
   });
 
-  ipcMain.handle("device:streamIsRunning", async (_, { deviceId }) => {
+  ipcMain.handle("stream:isRunning", async (_, { deviceId }) => {
     return scrcpy.isRunning(deviceId);
   });
 
-  // renderer KHÔNG require electron được, nên expose API tìm sourceId từ main
+  // renderer không require electron được -> expose list window sources từ main
   ipcMain.handle("stream:listWindowSources", async () => {
     const sources = await desktopCapturer.getSources({
       types: ["window"],
       fetchWindowIcons: false,
     });
-
-    // trả nhẹ: id + name
     return sources.map((s) => ({ id: s.id, name: s.name }));
   });
 
-  createWindow();
-
   app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    if (BrowserWindow.getAllWindows().length === 0) mainWindow = createWindow();
   });
 });
 

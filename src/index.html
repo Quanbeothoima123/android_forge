@@ -63,6 +63,10 @@
             font-size: 12px;
         }
 
+        .liveWrap {
+            position: relative;
+        }
+
         #liveVideo {
             width: 100%;
             height: 700px;
@@ -70,6 +74,25 @@
             border-radius: 8px;
             display: block;
             object-fit: contain;
+        }
+
+        #overlay {
+            position: absolute;
+            inset: 0;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            flex-direction: column;
+            gap: 10px;
+            color: #fff;
+            background: rgba(0, 0, 0, 0.55);
+            border-radius: 8px;
+            text-align: center;
+            padding: 12px;
+        }
+
+        #overlay button {
+            padding: 8px 14px;
         }
     </style>
 </head>
@@ -114,10 +137,16 @@
             </div>
 
             <div class="muted mini" style="margin: 6px 0 10px 0;">
-                Click để tap — kéo để swipe (phần mapping mình sẽ thêm tiếp sau khi stream lên được)
+                Click để tap — kéo để swipe (mapping theo % + xử lý letterbox)
             </div>
 
-            <video id="liveVideo" autoplay muted playsinline></video>
+            <div class="liveWrap">
+                <video id="liveVideo" autoplay muted playsinline></video>
+                <div id="overlay">
+                    <div id="overlayText">Stream ended</div>
+                    <button id="overlayStartBtn">Start Stream</button>
+                </div>
+            </div>
         </div>
 
         <div class="card">

@@ -167,7 +167,13 @@ async function tapXY() {
   log(`Tap X,Y on ${deviceId} at ${x},${y}`);
 }
 
+// NEW: throttle để tránh spam crash
+let lastKeyAt = 0;
 async function backBtn() {
+  const now = Date.now();
+  if (now - lastKeyAt < 120) return;
+  lastKeyAt = now;
+
   const deviceId = getSelectedDeviceId();
   await ensureAgent(deviceId);
   await window.forgeAPI.back(deviceId);
@@ -175,6 +181,10 @@ async function backBtn() {
 }
 
 async function homeBtn() {
+  const now = Date.now();
+  if (now - lastKeyAt < 120) return;
+  lastKeyAt = now;
+
   const deviceId = getSelectedDeviceId();
   await ensureAgent(deviceId);
   await window.forgeAPI.home(deviceId);
@@ -186,6 +196,8 @@ let currentCaptureStream = null;
 let streamingDeviceId = null;
 let deviceRes = null;
 
+let startingStream = false; // NEW lock
+
 function showOverlay(text) {
   $("overlayText").innerText = text;
   $("overlay").style.display = "flex";
@@ -195,7 +207,7 @@ function hideOverlay() {
   $("overlay").style.display = "none";
 }
 
-async function waitForWindowSourceId(deviceId, timeoutMs = 10000) {
+async function waitForWindowSourceId(deviceId, timeoutMs = 12000) {
   const needle = `forge:${deviceId}`;
   const t0 = Date.now();
 
@@ -221,7 +233,6 @@ async function attachCaptureToVideo(sourceId) {
   const stream = await navigator.mediaDevices.getUserMedia(constraints);
   const video = $("liveVideo");
 
-  // cleanup old
   if (currentCaptureStream) {
     try {
       currentCaptureStream.getTracks().forEach((t) => t.stop());
@@ -232,7 +243,6 @@ async function attachCaptureToVideo(sourceId) {
   video.srcObject = stream;
   await video.play();
 
-  // detect end
   const track = stream.getVideoTracks()[0];
   if (track) {
     track.onended = () => {
@@ -246,31 +256,40 @@ async function attachCaptureToVideo(sourceId) {
 }
 
 async function startStream() {
-  const deviceId = getSelectedDeviceId();
-  streamingDeviceId = deviceId;
+  if (startingStream) return;
+  startingStream = true;
 
-  hideOverlay();
+  const startBtn = $("startStreamBtn");
+  if (startBtn) startBtn.disabled = true;
 
-  await ensureAgent(deviceId);
+  try {
+    const deviceId = getSelectedDeviceId();
+    streamingDeviceId = deviceId;
 
-  const snap = await getSelectedDeviceSnapshot(deviceId);
-  deviceRes = mustHaveResolution(snap);
+    hideOverlay();
 
-  await window.forgeAPI.streamStart(deviceId);
-  log(`Stream start requested for ${deviceId}`);
+    await ensureAgent(deviceId);
 
-  const sourceId = await waitForWindowSourceId(deviceId, 12000);
-  if (!sourceId) {
-    showOverlay(
-      `Không tìm thấy cửa sổ scrcpy (forge:${deviceId}). Hãy bấm Start Stream lại.`
-    );
-    throw new Error(
-      `Không tìm thấy window scrcpy với title chứa "forge:${deviceId}"`
-    );
+    const snap = await getSelectedDeviceSnapshot(deviceId);
+    deviceRes = mustHaveResolution(snap);
+
+    await window.forgeAPI.streamStart(deviceId);
+    log(`Stream start requested for ${deviceId}`);
+
+    const sourceId = await waitForWindowSourceId(deviceId, 14000);
+    if (!sourceId) {
+      showOverlay(`Không tìm thấy cửa sổ scrcpy (forge:${deviceId}).`);
+      throw new Error(
+        `Không tìm thấy window scrcpy với title chứa "forge:${deviceId}"`
+      );
+    }
+
+    await attachCaptureToVideo(sourceId);
+    log(`Captured scrcpy window for ${deviceId}`);
+  } finally {
+    startingStream = false;
+    if (startBtn) startBtn.disabled = false;
   }
-
-  await attachCaptureToVideo(sourceId);
-  log(`Captured scrcpy window for ${deviceId}`);
 }
 
 async function stopStream() {
@@ -300,7 +319,6 @@ function getVideoContentRect(videoEl) {
 
   const vw = videoEl.videoWidth || 0;
   const vh = videoEl.videoHeight || 0;
-
   if (!vw || !vh) return null;
 
   const containerW = rect.width;
@@ -332,7 +350,6 @@ function clientToDeviceXY(ev) {
   const cx = ev.clientX;
   const cy = ev.clientY;
 
-  // nếu click vào vùng letterbox (đen) thì ignore
   if (
     cx < r.left ||
     cx > r.left + r.width ||
@@ -498,7 +515,6 @@ function wireUI() {
     }
   });
 
-  // scrcpy closed -> show overlay
   window.forgeAPI.onStreamEnded(({ deviceId }) => {
     if (streamingDeviceId && deviceId === streamingDeviceId) {
       log(`scrcpy closed for ${deviceId}`, true);
@@ -513,6 +529,4 @@ wireUI();
 wireLiveInteraction();
 refreshDevices();
 setInterval(refreshDevices, 1500);
-
-// startup overlay
 showOverlay("Chưa stream. Bấm Start Stream.");

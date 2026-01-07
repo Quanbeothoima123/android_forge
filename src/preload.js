@@ -21,7 +21,6 @@ contextBridge.exposeInMainWorld("forgeAPI", {
   longPress: (deviceId, x, y, durationMs) =>
     ipcRenderer.invoke("device:longPress", { deviceId, x, y, durationMs }),
 
-  // Stream controls (scrcpy GUI)
   streamStart: (deviceId) => ipcRenderer.invoke("stream:start", { deviceId }),
   streamStop: (deviceId) => ipcRenderer.invoke("stream:stop", { deviceId }),
   streamIsRunning: (deviceId) =>
@@ -30,11 +29,17 @@ contextBridge.exposeInMainWorld("forgeAPI", {
   // helper: tìm sourceId window scrcpy theo title
   getWindowSourceIdByTitleContains: async (needle) => {
     const sources = await ipcRenderer.invoke("stream:listWindowSources");
-    const hit = sources.find((s) => (s.name || "").includes(needle));
+
+    // ưu tiên match EXACT/startsWith trước để tránh nhầm khi nhiều window
+    const n = String(needle || "");
+    let hit =
+      sources.find((s) => String(s.name || "") === n) ||
+      sources.find((s) => String(s.name || "").startsWith(n)) ||
+      sources.find((s) => String(s.name || "").includes(n));
+
     return hit ? hit.id : null;
   },
 
-  // push event: scrcpy closed -> renderer
   onStreamEnded: (cb) => {
     ipcRenderer.on("stream:ended", (_, payload) => cb(payload));
   },

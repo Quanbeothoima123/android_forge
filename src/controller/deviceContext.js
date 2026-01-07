@@ -16,6 +16,10 @@ class DeviceContext {
     // Simple per-device queue: promise chain
     this._chain = Promise.resolve();
     this._disposed = false;
+
+    // NEW: protect against spam (Back/Home/Tap spam)
+    this._pending = 0;
+    this.maxPending = 25; // tune: 15~40 tùy bạn
   }
 
   updateFromDiscovery({ state, model }) {
@@ -23,7 +27,6 @@ class DeviceContext {
     this.state = state;
     if (model) this.model = model;
 
-    // If device not online, agent is not ready (for UI correctness)
     if (this.state !== "ONLINE") {
       this.agentReady = false;
     }
@@ -54,6 +57,7 @@ class DeviceContext {
       resolution: this.resolution,
       agentReady: this.agentReady,
       lastSeenAt: this.lastSeenAt,
+      pending: this._pending,
     };
   }
 
@@ -61,14 +65,29 @@ class DeviceContext {
     this._disposed = true;
   }
 
-  enqueue(taskFn) {
-    // FIX: Nếu task trước reject, chain vẫn phải tiếp tục (không "chết queue")
+  enqueue(taskFn, opts = {}) {
+    const dropIfBusy = opts.dropIfBusy !== false; // default true
+    if (dropIfBusy && this._pending >= this.maxPending) {
+      // tránh crash do spam
+      return Promise.reject(
+        new Error(
+          `Device busy: too many pending actions (${this._pending}). Slow down.`
+        )
+      );
+    }
+
+    this._pending++;
+
+    // FIX: nếu task trước reject, chain vẫn phải tiếp tục
     this._chain = this._chain
       .catch(() => {}) // swallow previous error to keep queue alive
       .then(async () => {
         if (this._disposed)
           throw new Error(`DeviceContext disposed: ${this.deviceId}`);
         return await taskFn();
+      })
+      .finally(() => {
+        this._pending = Math.max(0, this._pending - 1);
       });
 
     return this._chain;

@@ -13,7 +13,6 @@ class ScrcpyController extends EventEmitter {
   }
 
   start(deviceId, opts = {}) {
-    // Nếu đang chạy rồi thì không spawn nữa
     if (this.isRunning(deviceId)) return true;
 
     const title = `forge:${deviceId}`;
@@ -22,42 +21,35 @@ class ScrcpyController extends EventEmitter {
     const bitRate = opts.bitRate ?? "8M";
 
     const win = opts.window || {};
-    const borderless = win.borderless !== false; // default true
+    const borderless = win.borderless !== false;
     const alwaysOnTop = !!win.alwaysOnTop;
 
-    // Fallback size (PS sẽ clamp theo WorkingArea để không bị cắt)
     const targetW = Number.isFinite(win.width) ? Number(win.width) : 360;
     const targetH = Number.isFinite(win.height) ? Number(win.height) : 800;
 
-    // corner: "bottom-right" | "bottom-left" | "top-right" | "top-left"
-    const corner = win.corner || "bottom-right";
-    const margin = Number.isFinite(win.margin) ? Number(win.margin) : 12;
+    const corner = win.corner || "top-left"; // NEW default
+    const margin = Number.isFinite(win.margin) ? Number(win.margin) : 8;
 
     const args = [
       "-s",
       deviceId,
-
       "--no-audio",
       "--no-control",
-
       "--window-title",
       title,
-
       "--max-fps",
       String(maxFps),
-
       "--video-bit-rate",
       String(bitRate),
+      "--window-width",
+      String(targetW),
+      "--window-height",
+      String(targetH),
     ];
 
-    // tránh đụng port với agent (agent dùng 27183)
     if (opts.portRange) {
       args.push("--port", String(opts.portRange));
     }
-
-    // set size initial (PS sẽ chỉnh lại nếu vượt WorkingArea)
-    args.push("--window-width", String(targetW));
-    args.push("--window-height", String(targetH));
 
     if (borderless) args.push("--window-borderless");
     if (alwaysOnTop) args.push("--always-on-top");
@@ -84,22 +76,20 @@ class ScrcpyController extends EventEmitter {
 
     this.procs.set(deviceId, { proc, title });
 
-    // Apply window rules (move to corner + optionally send-to-bottom)
-    // IMPORTANT: không được throw ở đây làm fail IPC handler.
     const rules = {
       width: targetW,
       height: targetH,
       corner,
       margin,
-      // nếu muốn “nằm dưới Electron” thì bật sendToBottom
+      // push scrcpy xuống dưới (Electron che lên) - vẫn "visible" nên không đen
       sendToBottom: !!(opts.zOrder && opts.zOrder.sendToBottom),
       noActivate: !!(opts.zOrder && opts.zOrder.noActivate),
       timeoutMs: Number.isFinite(win.timeoutMs) ? Number(win.timeoutMs) : 12000,
     };
 
+    // IMPORTANT: tuyệt đối không throw ra ngoài
     this._applyWindowRulesByTitle(title, rules).catch((e) => {
       console.log("[scrcpy window rules] failed:", e.message);
-      // Không throw.
     });
 
     return true;
@@ -120,21 +110,26 @@ class ScrcpyController extends EventEmitter {
     for (const id of Array.from(this.procs.keys())) this.stop(id);
   }
 
+  _escapeForPS(str) {
+    // escape double quotes in PS string context
+    return String(str).replace(/"/g, '""');
+  }
+
   _applyWindowRulesByTitle(title, rules) {
     const width = Number(rules.width || 360);
     const height = Number(rules.height || 800);
-    const margin = Number(rules.margin || 12);
-    const corner = String(rules.corner || "bottom-right");
+    const margin = Number(rules.margin || 8);
+    const corner = String(rules.corner || "top-left");
     const sendToBottom = !!rules.sendToBottom;
     const noActivate = !!rules.noActivate;
     const timeoutMs = Number(rules.timeoutMs || 12000);
 
-    // FIX 1: KHÔNG dùng ToString() (T hoa) nữa
+    const titlePS = this._escapeForPS(title);
+    const cornerPS = this._escapeForPS(corner);
+
     const sendToBottomPS = sendToBottom ? "true" : "false";
     const noActivatePS = noActivate ? "true" : "false";
 
-    // PS: find window by title contains -> compute x/y by WorkingArea -> clamp size if needed -> MoveWindow
-    // Optional: SetWindowPos(HWND_BOTTOM) to push under other windows.
     const ps = `
 Add-Type @"
 using System;
@@ -183,11 +178,11 @@ function FindWindowContainsTitle($needle) {
 Add-Type -AssemblyName System.Windows.Forms | Out-Null
 $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
 
-$needle = "${title}"
+$needle = "${titlePS}"
 $w = ${width}
 $h = ${height}
 $m = ${margin}
-$corner = "${corner}"
+$corner = "${cornerPS}"
 $sendToBottom = ${sendToBottomPS}
 $noActivate = ${noActivatePS}
 $timeoutMs = ${timeoutMs}
@@ -201,7 +196,7 @@ while ((Get-Date) -lt $deadline -and $hwnd -eq [IntPtr]::Zero) {
 
 if ($hwnd -eq [IntPtr]::Zero) { exit 0 }
 
-# FIX 2: clamp SIZE theo WORKING AREA để không bị "cắt dưới"
+# clamp size to WorkingArea
 $maxW = $wa.Width - (2 * $m)
 $maxH = $wa.Height - (2 * $m)
 if ($w -gt $maxW) { $w = $maxW }
@@ -209,7 +204,7 @@ if ($h -gt $maxH) { $h = $maxH }
 if ($w -lt 120) { $w = 120 }
 if ($h -lt 200) { $h = 200 }
 
-# compute X/Y inside WORKING AREA (avoid taskbar cropping)
+# position (default stack top-left)
 $X = $wa.Left + $m
 $Y = $wa.Top + $m
 
@@ -223,7 +218,6 @@ if ($corner -eq "bottom-right") {
   $X = $wa.Right - $w - $m
   $Y = $wa.Top + $m
 } else {
-  # top-left default
   $X = $wa.Left + $m
   $Y = $wa.Top + $m
 }

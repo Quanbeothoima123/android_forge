@@ -31,6 +31,8 @@ function dropForwardCache(deviceId) {
 function sendJsonLine(host, port, obj, timeoutMs = 2500) {
   return new Promise((resolve, reject) => {
     const socket = new net.Socket();
+    socket.setNoDelay(true);
+
     let done = false;
     let buf = "";
 
@@ -87,7 +89,6 @@ function sendJsonLine(host, port, obj, timeoutMs = 2500) {
 }
 
 async function callAgent(deviceId, payload, timeoutMs) {
-  // retry 1 lần nếu timeout/closed (thường do forward stale)
   try {
     const localPort = await ensureForward(deviceId);
     return await sendJsonLine("127.0.0.1", localPort, payload, timeoutMs);

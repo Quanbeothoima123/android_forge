@@ -41,21 +41,14 @@ function ensureOnline(ctx) {
   return ctx;
 }
 
-// helper: compute scrcpy window size based on device resolution
 function computeScrcpyWindowSize(deviceSnapshot) {
   const res = deviceSnapshot?.resolution;
-  // fallback
-  if (!res || !res.width || !res.height) return { width: 420, height: 900 };
+  if (!res || !res.width || !res.height) return { width: 360, height: 800 };
 
-  // capture width bạn muốn (tăng lên để nét hơn, và tránh “hơi thấp”)
-  const targetW = 420;
-
-  // height theo aspect, cộng thêm một chút dư địa
+  // Window nhỏ để stack, đủ nét để capture
+  const targetW = 360;
   const h = Math.round(targetW * (res.height / res.width));
-
-  // clamp để không quá cao
-  const targetH = Math.max(480, Math.min(1100, h));
-
+  const targetH = Math.max(260, Math.min(900, h));
   return { width: targetW, height: targetH };
 }
 
@@ -63,7 +56,6 @@ app.whenReady().then(() => {
   mainWindow = createWindow();
   registry.startPolling(1500);
 
-  // forward scrcpy close events -> renderer
   scrcpy.on("closed", ({ deviceId, code, signal }) => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
     mainWindow.webContents.send("stream:ended", { deviceId, code, signal });
@@ -112,39 +104,44 @@ app.whenReady().then(() => {
     );
   });
 
-  // ===== STREAM: start/stop scrcpy GUI =====
+  // ===== STREAM =====
   ipcMain.handle("stream:start", async (_, { deviceId }) => {
     const ctx = ensureOnline(registry.get(deviceId));
+
+    // ping trước để chắc agent/forward ok
     await ctx.enqueue(() => ping(deviceId));
 
-    const snap = registry.get(deviceId)?.snapshot?.()
-      ? registry.get(deviceId).snapshot()
-      : null;
-
+    const snap = ctx.snapshot();
     const { width, height } = computeScrcpyWindowSize(snap);
 
-    // Start scrcpy (corner + borderless). KHÔNG offscreen, KHÔNG minimize.
-    scrcpy.start(deviceId, {
-      maxFps: 30,
-      bitRate: "8M",
-      portRange: "27200:27299",
+    // IMPORTANT: scrcpy.start không được throw để renderer khỏi phải bấm lần 2
+    try {
+      scrcpy.start(deviceId, {
+        maxFps: 30,
+        bitRate: "8M",
+        portRange: "27200:27299",
 
-      window: {
-        width,
-        height,
-        corner: "bottom-right",
-        margin: 12,
-        borderless: true,
-        alwaysOnTop: false,
-        timeoutMs: 9000,
-      },
+        // Stack tất cả scrcpy vào top-left để tránh “cắt dưới” + giảm rối
+        window: {
+          width,
+          height,
+          corner: "top-left",
+          margin: 6,
+          borderless: true,
+          alwaysOnTop: false,
+          timeoutMs: 12000,
+        },
 
-      // Trick: push scrcpy xuống dưới (Electron sẽ che lên)
-      zOrder: {
-        sendToBottom: true,
-        noActivate: true,
-      },
-    });
+        // Đẩy xuống dưới (Electron sẽ che lên)
+        zOrder: {
+          sendToBottom: true,
+          noActivate: true,
+        },
+      });
+    } catch (e) {
+      // tuyệt đối không throw ra renderer (tránh “click lần 2 mới chạy”)
+      console.log("[stream:start] scrcpy.start failed:", e.message);
+    }
 
     return { ok: true };
   });
@@ -158,7 +155,6 @@ app.whenReady().then(() => {
     return scrcpy.isRunning(deviceId);
   });
 
-  // renderer cannot require electron -> expose list window sources
   ipcMain.handle("stream:listWindowSources", async () => {
     const sources = await desktopCapturer.getSources({
       types: ["window"],
@@ -168,9 +164,7 @@ app.whenReady().then(() => {
   });
 
   app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      mainWindow = createWindow();
-    }
+    if (BrowserWindow.getAllWindows().length === 0) mainWindow = createWindow();
   });
 });
 

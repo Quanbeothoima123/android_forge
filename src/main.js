@@ -17,7 +17,6 @@ if (require("electron-squirrel-startup")) {
 }
 
 const registry = new DeviceRegistry();
-
 let mainWindow = null;
 
 function createWindow() {
@@ -42,19 +41,32 @@ function ensureOnline(ctx) {
   return ctx;
 }
 
+// helper: compute scrcpy window size based on device resolution
+function computeScrcpyWindowSize(deviceSnapshot) {
+  const res = deviceSnapshot?.resolution;
+  // fallback
+  if (!res || !res.width || !res.height) return { width: 420, height: 900 };
+
+  // capture width bạn muốn (tăng lên để nét hơn, và tránh “hơi thấp”)
+  const targetW = 420;
+
+  // height theo aspect, cộng thêm một chút dư địa
+  const h = Math.round(targetW * (res.height / res.width));
+
+  // clamp để không quá cao
+  const targetH = Math.max(480, Math.min(1100, h));
+
+  return { width: targetW, height: targetH };
+}
+
 app.whenReady().then(() => {
   mainWindow = createWindow();
-
   registry.startPolling(1500);
 
   // forward scrcpy close events -> renderer
   scrcpy.on("closed", ({ deviceId, code, signal }) => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
-    mainWindow.webContents.send("stream:ended", {
-      deviceId,
-      code,
-      signal,
-    });
+    mainWindow.webContents.send("stream:ended", { deviceId, code, signal });
   });
 
   ipcMain.handle("devices:list", async () => registry.listSnapshots());
@@ -105,21 +117,32 @@ app.whenReady().then(() => {
     const ctx = ensureOnline(registry.get(deviceId));
     await ctx.enqueue(() => ping(deviceId));
 
-    // IMPORTANT: keep GUI, but move it to corner + small size (not minimized)
+    const snap = registry.get(deviceId)?.snapshot?.()
+      ? registry.get(deviceId).snapshot()
+      : null;
+
+    const { width, height } = computeScrcpyWindowSize(snap);
+
+    // Start scrcpy (corner + borderless). KHÔNG offscreen, KHÔNG minimize.
     scrcpy.start(deviceId, {
       maxFps: 30,
       bitRate: "8M",
-      // tránh port đụng agent
       portRange: "27200:27299",
-      // đưa cửa sổ vào góc + nhỏ
-      moveWindow: {
-        // bạn có thể chỉnh lại tùy màn hình
-        width: 260,
-        height: 580,
-        // -1 nghĩa là tự tính góc phải dưới theo màn hình chính
-        x: -1,
-        y: -1,
-        margin: 10,
+
+      window: {
+        width,
+        height,
+        corner: "bottom-right",
+        margin: 12,
+        borderless: true,
+        alwaysOnTop: false,
+        timeoutMs: 9000,
+      },
+
+      // Trick: push scrcpy xuống dưới (Electron sẽ che lên)
+      zOrder: {
+        sendToBottom: true,
+        noActivate: true,
       },
     });
 
@@ -135,7 +158,7 @@ app.whenReady().then(() => {
     return scrcpy.isRunning(deviceId);
   });
 
-  // renderer không require electron được -> expose list window sources từ main
+  // renderer cannot require electron -> expose list window sources
   ipcMain.handle("stream:listWindowSources", async () => {
     const sources = await desktopCapturer.getSources({
       types: ["window"],
@@ -145,7 +168,9 @@ app.whenReady().then(() => {
   });
 
   app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) mainWindow = createWindow();
+    if (BrowserWindow.getAllWindows().length === 0) {
+      mainWindow = createWindow();
+    }
   });
 });
 

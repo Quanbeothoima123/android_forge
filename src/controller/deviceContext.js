@@ -62,12 +62,15 @@ class DeviceContext {
   }
 
   enqueue(taskFn) {
-    // taskFn must return promise
-    this._chain = this._chain.then(async () => {
-      if (this._disposed)
-        throw new Error(`DeviceContext disposed: ${this.deviceId}`);
-      return await taskFn();
-    });
+    // FIX: Nếu task trước reject, chain vẫn phải tiếp tục (không "chết queue")
+    this._chain = this._chain
+      .catch(() => {}) // swallow previous error to keep queue alive
+      .then(async () => {
+        if (this._disposed)
+          throw new Error(`DeviceContext disposed: ${this.deviceId}`);
+        return await taskFn();
+      });
+
     return this._chain;
   }
 }

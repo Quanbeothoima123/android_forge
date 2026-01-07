@@ -24,7 +24,11 @@ async function ensureForward(deviceId) {
   return localPort;
 }
 
-function sendJsonLine(host, port, obj, timeoutMs = 1500) {
+function dropForwardCache(deviceId) {
+  forwardCache.delete(deviceId);
+}
+
+function sendJsonLine(host, port, obj, timeoutMs = 2500) {
   return new Promise((resolve, reject) => {
     const socket = new net.Socket();
     let done = false;
@@ -82,47 +86,55 @@ function sendJsonLine(host, port, obj, timeoutMs = 1500) {
   });
 }
 
+async function callAgent(deviceId, payload, timeoutMs) {
+  // retry 1 lần nếu timeout/closed (thường do forward stale)
+  try {
+    const localPort = await ensureForward(deviceId);
+    return await sendJsonLine("127.0.0.1", localPort, payload, timeoutMs);
+  } catch (e) {
+    const msg = String(e && e.message ? e.message : e);
+    if (msg.includes("timeout") || msg.includes("closed")) {
+      dropForwardCache(deviceId);
+      const localPort2 = await ensureForward(deviceId);
+      return await sendJsonLine("127.0.0.1", localPort2, payload, timeoutMs);
+    }
+    throw e;
+  }
+}
+
 async function ping(deviceId) {
-  const localPort = await ensureForward(deviceId);
-  await sendJsonLine("127.0.0.1", localPort, { type: "PING" }, 1200);
+  await callAgent(deviceId, { type: "PING" }, 3500);
   return true;
 }
 
 async function tap(deviceId, x, y) {
-  const localPort = await ensureForward(deviceId);
-  await sendJsonLine("127.0.0.1", localPort, { type: "TAP", x, y }, 1500);
+  await callAgent(deviceId, { type: "TAP", x, y }, 2500);
   return true;
 }
 
 async function longPress(deviceId, x, y, durationMs = 600) {
-  const localPort = await ensureForward(deviceId);
-  await sendJsonLine(
-    "127.0.0.1",
-    localPort,
+  await callAgent(
+    deviceId,
     { type: "LONG_PRESS", x, y, durationMs: Number(durationMs) },
-    2500
+    4000
   );
   return true;
 }
 
 async function swipe(deviceId, x1, y1, x2, y2, durationMs = 220) {
-  const localPort = await ensureForward(deviceId);
-  await sendJsonLine(
-    "127.0.0.1",
-    localPort,
+  await callAgent(
+    deviceId,
     { type: "SWIPE", x1, y1, x2, y2, durationMs: Number(durationMs) },
-    2500
+    4000
   );
   return true;
 }
 
 async function key(deviceId, keyName) {
-  const localPort = await ensureForward(deviceId);
-  await sendJsonLine(
-    "127.0.0.1",
-    localPort,
+  await callAgent(
+    deviceId,
     { type: "KEY", key: String(keyName).toUpperCase() },
-    1500
+    3000
   );
   return true;
 }

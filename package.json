@@ -24,6 +24,8 @@
     "electron": "39.2.7"
   },
   "dependencies": {
+    "@yume-chan/adb": "^2.5.1",
+    "@yume-chan/adb-scrcpy": "^2.3.2",
     "electron-squirrel-startup": "^1.0.1",
     "ffmpeg-static": "^5.2.0",
     "ws": "^8.18.0"

@@ -1,15 +1,31 @@
+// src/preload.js
 const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("forgeAPI", {
   listDevices: () => ipcRenderer.invoke("devices:list"),
-  agentPing: (deviceId) => ipcRenderer.invoke("device:agentPing", { deviceId }),
 
-  tap: (deviceId, x, y) => ipcRenderer.invoke("device:tap", { deviceId, x, y }),
-  home: (deviceId) => ipcRenderer.invoke("device:home", { deviceId }),
-  back: (deviceId) => ipcRenderer.invoke("device:back", { deviceId }),
+  // scrcpy
+  scrcpyStart: (deviceId) => ipcRenderer.invoke("scrcpy:start", { deviceId }),
+  scrcpyStop: (deviceId) => ipcRenderer.invoke("scrcpy:stop", { deviceId }),
+  scrcpyIsRunning: (deviceId) =>
+    ipcRenderer.invoke("scrcpy:isRunning", { deviceId }),
+  scrcpyStartAll: () => ipcRenderer.invoke("scrcpy:startAll"),
+  scrcpyStopAll: () => ipcRenderer.invoke("scrcpy:stopAll"),
+  onScrcpyClosed: (cb) => {
+    ipcRenderer.on("scrcpy:closed", (_, payload) => cb(payload));
+  },
 
-  swipe: (deviceId, x1, y1, x2, y2, durationMs) =>
-    ipcRenderer.invoke("device:swipe", {
+  // controls
+  home: (deviceId) => ipcRenderer.invoke("control:home", { deviceId }),
+  back: (deviceId) => ipcRenderer.invoke("control:back", { deviceId }),
+  recents: (deviceId) => ipcRenderer.invoke("control:recents", { deviceId }),
+  wake: (deviceId) => ipcRenderer.invoke("control:wake", { deviceId }),
+
+  tapRaw: (deviceId, x, y) =>
+    ipcRenderer.invoke("control:tapRaw", { deviceId, x, y }),
+
+  swipeRaw: (deviceId, x1, y1, x2, y2, durationMs) =>
+    ipcRenderer.invoke("control:swipeRaw", {
       deviceId,
       x1,
       y1,
@@ -18,29 +34,6 @@ contextBridge.exposeInMainWorld("forgeAPI", {
       durationMs,
     }),
 
-  longPress: (deviceId, x, y, durationMs) =>
-    ipcRenderer.invoke("device:longPress", { deviceId, x, y, durationMs }),
-
-  streamStart: (deviceId) => ipcRenderer.invoke("stream:start", { deviceId }),
-  streamStop: (deviceId) => ipcRenderer.invoke("stream:stop", { deviceId }),
-  streamIsRunning: (deviceId) =>
-    ipcRenderer.invoke("stream:isRunning", { deviceId }),
-
-  // helper: tìm sourceId window scrcpy theo title
-  getWindowSourceIdByTitleContains: async (needle) => {
-    const sources = await ipcRenderer.invoke("stream:listWindowSources");
-
-    // ưu tiên match EXACT/startsWith trước để tránh nhầm khi nhiều window
-    const n = String(needle || "");
-    let hit =
-      sources.find((s) => String(s.name || "") === n) ||
-      sources.find((s) => String(s.name || "").startsWith(n)) ||
-      sources.find((s) => String(s.name || "").includes(n));
-
-    return hit ? hit.id : null;
-  },
-
-  onStreamEnded: (cb) => {
-    ipcRenderer.on("stream:ended", (_, payload) => cb(payload));
-  },
+  swipeDir: (deviceId, dir) =>
+    ipcRenderer.invoke("control:swipeDir", { deviceId, dir }),
 });

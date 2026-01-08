@@ -28,11 +28,9 @@ function dropForwardCache(deviceId) {
   forwardCache.delete(deviceId);
 }
 
-function sendJsonLine(host, port, obj, timeoutMs = 2500) {
+function sendJsonLine(host, port, obj, timeoutMs = 3000) {
   return new Promise((resolve, reject) => {
     const socket = new net.Socket();
-    socket.setNoDelay(true);
-
     let done = false;
     let buf = "";
 
@@ -88,28 +86,37 @@ function sendJsonLine(host, port, obj, timeoutMs = 2500) {
   });
 }
 
+function isRetryableError(e) {
+  const msg = String(e?.message || e || "");
+  return (
+    msg.includes("timeout") ||
+    msg.includes("closed") ||
+    msg.includes("ECONNRESET") ||
+    msg.includes("EPIPE")
+  );
+}
+
 async function callAgent(deviceId, payload, timeoutMs) {
+  // retry 1 lần nếu timeout/closed (thường do forward stale hoặc agent vừa wake)
   try {
     const localPort = await ensureForward(deviceId);
     return await sendJsonLine("127.0.0.1", localPort, payload, timeoutMs);
   } catch (e) {
-    const msg = String(e && e.message ? e.message : e);
-    if (msg.includes("timeout") || msg.includes("closed")) {
-      dropForwardCache(deviceId);
-      const localPort2 = await ensureForward(deviceId);
-      return await sendJsonLine("127.0.0.1", localPort2, payload, timeoutMs);
-    }
-    throw e;
+    if (!isRetryableError(e)) throw e;
+
+    dropForwardCache(deviceId);
+    const localPort2 = await ensureForward(deviceId);
+    return await sendJsonLine("127.0.0.1", localPort2, payload, timeoutMs);
   }
 }
 
 async function ping(deviceId) {
-  await callAgent(deviceId, { type: "PING" }, 3500);
+  await callAgent(deviceId, { type: "PING" }, 4000);
   return true;
 }
 
 async function tap(deviceId, x, y) {
-  await callAgent(deviceId, { type: "TAP", x, y }, 2500);
+  await callAgent(deviceId, { type: "TAP", x, y }, 3000);
   return true;
 }
 
@@ -117,7 +124,7 @@ async function longPress(deviceId, x, y, durationMs = 600) {
   await callAgent(
     deviceId,
     { type: "LONG_PRESS", x, y, durationMs: Number(durationMs) },
-    4000
+    5000
   );
   return true;
 }
@@ -126,7 +133,7 @@ async function swipe(deviceId, x1, y1, x2, y2, durationMs = 220) {
   await callAgent(
     deviceId,
     { type: "SWIPE", x1, y1, x2, y2, durationMs: Number(durationMs) },
-    4000
+    5000
   );
   return true;
 }
@@ -135,7 +142,7 @@ async function key(deviceId, keyName) {
   await callAgent(
     deviceId,
     { type: "KEY", key: String(keyName).toUpperCase() },
-    3000
+    3500
   );
   return true;
 }

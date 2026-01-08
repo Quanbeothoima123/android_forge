@@ -10,33 +10,32 @@
             margin: 16px;
         }
 
+        h1 {
+            margin: 0 0 10px 0;
+        }
+
         .row {
             display: flex;
-            gap: 12px;
+            gap: 10px;
             align-items: center;
             flex-wrap: wrap;
         }
 
-        select,
         button,
-        input {
+        input,
+        select {
             padding: 6px 10px;
-        }
-
-        input {
-            width: 110px;
         }
 
         .muted {
             color: #666;
         }
 
-        .grid {
+        .layout {
             display: grid;
             grid-template-columns: 420px 1fr;
             gap: 16px;
-            margin-top: 16px;
-            align-items: start;
+            margin-top: 14px;
         }
 
         .card {
@@ -45,115 +44,158 @@
             border-radius: 8px;
         }
 
-        ul {
-            margin-top: 8px;
-        }
-
         .err {
             color: #b00020;
         }
 
-        code {
-            background: #f5f5f5;
-            padding: 2px 6px;
-            border-radius: 4px;
+        #log {
+            max-height: 320px;
+            overflow: auto;
         }
 
-        .mini {
+        #devices {
+            max-height: 520px;
+            overflow: auto;
+        }
+
+        .deviceItem {
+            padding: 8px;
+            border: 1px solid #eee;
+            border-radius: 8px;
+            margin-bottom: 8px;
+            cursor: pointer;
+        }
+
+        .deviceItem.selected {
+            border-color: #999;
+            background: #fafafa;
+        }
+
+        .badge {
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 999px;
+            background: #f2f2f2;
+        }
+
+        .badge.ok {
+            background: #e6ffed;
+        }
+
+        .badge.bad {
+            background: #ffecec;
+        }
+
+        .kv {
+            font-size: 12px;
+            margin-top: 4px;
+        }
+
+        .gridBtns {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 8px;
+        }
+
+        .sectionTitle {
+            margin: 12px 0 8px 0;
+            font-size: 14px;
+        }
+
+        .inline {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .small {
             font-size: 12px;
         }
 
-        .liveWrap {
-            position: relative;
+        .mono {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
         }
 
-        #liveVideo {
-            width: 100%;
-            height: 700px;
-            background: #000;
-            border-radius: 8px;
-            display: block;
-            object-fit: contain;
+        input.w90 {
+            width: 90px;
         }
 
-        #overlay {
-            position: absolute;
-            inset: 0;
-            display: none;
-            align-items: center;
-            justify-content: center;
-            flex-direction: column;
-            gap: 10px;
-            color: #fff;
-            background: rgba(0, 0, 0, 0.55);
-            border-radius: 8px;
-            text-align: center;
-            padding: 12px;
-        }
-
-        #overlay button {
-            padding: 8px 14px;
+        input.w120 {
+            width: 120px;
         }
     </style>
 </head>
 
 <body>
-    <h1>Android Forge</h1>
+    <h1>Android Forge — Control Panel (No Electron Streaming)</h1>
 
     <div class="row">
-        <label>Chọn thiết bị:</label>
-        <select id="deviceSelect"></select>
+        <button id="startAllBtn">Start All scrcpy</button>
+        <button id="stopAllBtn">Stop All scrcpy</button>
 
-        <button id="tapCenterBtn">Tap Center</button>
-        <button id="longPressCenterBtn">Long Press Center</button>
+        <label class="row" style="gap:6px;">
+            <input id="autoStartChk" type="checkbox" />
+            AutoStart (ONLINE → tự start scrcpy)
+        </label>
 
-        <button id="swipeUpBtn">Swipe Up</button>
-        <button id="swipeDownBtn">Swipe Down</button>
-
-        <button id="backBtn">Back</button>
-        <button id="homeBtn">Home</button>
-
-        <span class="muted">Tip: nếu Agent chưa READY, bật Accessibility của AndroidForgeAgent.</span>
+        <span class="muted small">
+            scrcpy mở trực tiếp (manual control). Electron chỉ điều khiển nhanh + sắp xếp cửa sổ.
+        </span>
     </div>
 
-    <div class="row" style="margin-top: 12px;">
-        <strong>Tap theo tọa độ:</strong>
-        <label>X</label>
-        <input id="xInput" type="number" placeholder="x (px)" />
-        <label>Y</label>
-        <input id="yInput" type="number" placeholder="y (px)" />
-        <button id="tapXYBtn">Tap X,Y</button>
-        <span class="muted mini">(tọa độ px theo resolution của máy — xem ở danh sách Devices)</span>
-    </div>
-
-    <div class="grid">
+    <div class="layout">
         <div class="card">
-            <div class="row" style="justify-content: space-between;">
-                <h2 style="margin:0;">Live Screen</h2>
-                <div class="row">
-                    <button id="startStreamBtn">Start Stream</button>
-                    <button id="stopStreamBtn">Stop Stream</button>
-                </div>
-            </div>
-
-            <div class="muted mini" style="margin: 6px 0 10px 0;">
-                Click để tap — kéo để swipe (mapping theo % + xử lý letterbox)
-            </div>
-
-            <div class="liveWrap">
-                <video id="liveVideo" autoplay muted playsinline></video>
-                <div id="overlay">
-                    <div id="overlayText">Stream ended</div>
-                    <button id="overlayStartBtn">Start Stream</button>
-                </div>
-            </div>
+            <h2 style="margin:0 0 10px 0;">Devices</h2>
+            <div id="devices" class="muted">(loading...)</div>
         </div>
 
         <div class="card">
-            <h2>Devices</h2>
-            <ul id="devices"></ul>
+            <h2 style="margin:0 0 10px 0;">Selected Device</h2>
 
-            <h2 style="margin-top:16px;">Log</h2>
+            <div id="selectedInfo" class="muted">(chọn thiết bị bên trái)</div>
+
+            <div class="sectionTitle">scrcpy</div>
+            <div class="inline">
+                <button id="startBtn">Start</button>
+                <button id="stopBtn">Stop</button>
+                <span id="runningBadge" class="badge">RUNNING: ?</span>
+            </div>
+
+            <div class="sectionTitle">Quick Controls</div>
+            <div class="gridBtns">
+                <button id="wakeBtn">Wake</button>
+                <button id="homeBtn">Home</button>
+                <button id="backBtn">Back</button>
+                <button id="recentsBtn">Recents</button>
+
+                <button id="swipeUpBtn">Swipe Up</button>
+                <button id="swipeDownBtn">Swipe Down</button>
+                <button id="swipeLeftBtn">Swipe Left</button>
+                <button id="swipeRightBtn">Swipe Right</button>
+            </div>
+
+            <div class="sectionTitle">Tap (Hybrid: % hoặc px)</div>
+            <div class="inline small">
+                <span class="muted">X:</span>
+                <input id="tapX" class="w120" placeholder="50% hoặc 540" />
+                <span class="muted">Y:</span>
+                <input id="tapY" class="w120" placeholder="50% hoặc 1200" />
+                <button id="tapBtn">Tap</button>
+                <span class="muted small">Ví dụ: 50% / 0.5 / 540</span>
+            </div>
+
+            <div class="sectionTitle">Swipe (Hybrid: % hoặc px)</div>
+            <div class="inline small">
+                <input id="swX1" class="w90" placeholder="x1" />
+                <input id="swY1" class="w90" placeholder="y1" />
+                <input id="swX2" class="w90" placeholder="x2" />
+                <input id="swY2" class="w90" placeholder="y2" />
+                <input id="swDur" class="w90" placeholder="dur(ms)" value="220" />
+                <button id="swipeBtn">Swipe</button>
+            </div>
+
+            <div class="sectionTitle">Log</div>
             <div id="log" class="muted">(log sẽ hiện ở đây)</div>
         </div>
     </div>

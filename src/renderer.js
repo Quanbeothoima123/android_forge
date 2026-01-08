@@ -1,532 +1,301 @@
+// src/renderer.js
 function $(id) {
   return document.getElementById(id);
 }
 
 function log(msg, isError = false) {
   const el = $("log");
-  if (!el) return;
   const t = new Date().toLocaleTimeString();
   el.innerHTML =
     `<div class="${isError ? "err" : ""}">[${t}] ${msg}</div>` + el.innerHTML;
 }
 
-function formatDevice(d) {
-  const model = d.model ? d.model : "(unknown model)";
-  const ver = d.androidVersion ? d.androidVersion : "(unknown ver)";
-  const res =
-    d.resolution && d.resolution.width && d.resolution.height
-      ? `${d.resolution.width}x${d.resolution.height}`
-      : "(unknown res)";
-  const agent = d.agentReady ? "AGENT:READY" : "AGENT:OFF";
-  return `${d.deviceId} — ${d.state} — ${model} — Android ${ver} — ${res} — ${agent}`;
+function fmtRes(d) {
+  if (d?.resolution?.width)
+    return `${d.resolution.width}x${d.resolution.height}`;
+  return "?";
 }
 
-async function refreshDevices() {
-  const listEl = $("devices");
-  const selEl = $("deviceSelect");
+// ===== selection =====
+let selectedDeviceId = "";
+const devicesById = new Map();
+
+// ===== FIX: prevent autostart spamming =====
+const autoStartPending = new Set(); // deviceId
+
+function renderDevices(devices) {
+  const wrap = $("devices");
+  wrap.innerHTML = "";
+
+  if (!devices.length) {
+    wrap.innerHTML = `<div class="muted">(Không thấy thiết bị — kiểm tra adb devices -l)</div>`;
+    return;
+  }
+
+  for (const d of devices) {
+    const div = document.createElement("div");
+    div.className =
+      "deviceItem" + (d.deviceId === selectedDeviceId ? " selected" : "");
+    div.dataset.deviceId = d.deviceId;
+
+    const badgeClass = d.agentReady ? "badge ok" : "badge bad";
+    const badgeText = d.agentReady ? "READY" : "AGENT OFF";
+
+    div.innerHTML = `
+      <div style="display:flex; justify-content:space-between; gap:8px; align-items:center;">
+        <div style="min-width:0;">
+          <div style="font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+            ${d.model || d.deviceId}
+          </div>
+          <div class="kv muted mono" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+            ${d.deviceId}
+          </div>
+          <div class="kv muted">
+            Android ${d.androidVersion || "?"} • ${fmtRes(d)} • ${d.state}
+          </div>
+        </div>
+        <div style="display:flex; flex-direction:column; gap:6px; align-items:flex-end;">
+          <span class="${badgeClass}">${badgeText}</span>
+        </div>
+      </div>
+    `;
+
+    div.addEventListener("click", () => {
+      selectedDeviceId = d.deviceId;
+      refreshUI();
+    });
+
+    wrap.appendChild(div);
+  }
+}
+
+async function updateSelectedInfo() {
+  if (!selectedDeviceId) {
+    $("selectedInfo").textContent = "(chọn thiết bị bên trái)";
+    $("runningBadge").textContent = "RUNNING: ?";
+    return;
+  }
+
+  const d = devicesById.get(selectedDeviceId);
+  if (!d) return;
+
+  $("selectedInfo").innerHTML = `
+    <div><b>${d.model || selectedDeviceId}</b></div>
+    <div class="muted mono">${selectedDeviceId}</div>
+    <div class="muted">State: ${d.state} • Android ${d.androidVersion || "?"} • Res: ${fmtRes(d)}</div>
+  `;
 
   try {
-    const devices = await window.forgeAPI.listDevices();
+    const running = await window.forgeAPI.scrcpyIsRunning(selectedDeviceId);
+    const badge = $("runningBadge");
+    badge.textContent = `RUNNING: ${running ? "YES" : "NO"}`;
+    badge.className = "badge " + (running ? "ok" : "bad");
+  } catch {
+    // ignore
+  }
+}
 
-    if (!devices.length) {
-      listEl.innerHTML =
-        "<li>(Không thấy thiết bị — kiểm tra <code>adb devices -l</code>)</li>";
-    } else {
-      listEl.innerHTML = devices
-        .map((d) => `<li>${formatDevice(d)}</li>`)
-        .join("");
-    }
+// ===== Hybrid parse =====
+function parseHybrid(raw) {
+  const s = String(raw || "").trim();
+  if (!s) throw new Error("Empty coordinate");
 
-    const online = devices.filter((d) => d.state === "ONLINE");
-    const current = selEl.value;
+  if (s.endsWith("%")) {
+    const n = Number(s.slice(0, -1).trim());
+    if (!Number.isFinite(n)) throw new Error(`Invalid percent: ${s}`);
+    return { value: n, unit: "pct" };
+  }
 
-    selEl.innerHTML = online
-      .map((d) => {
-        const label = d.model
-          ? `${d.model} (${d.deviceId.slice(0, 8)}…)`
-          : d.deviceId;
-        return `<option value="${d.deviceId}">${label}</option>`;
-      })
-      .join("");
+  const n = Number(s);
+  if (!Number.isFinite(n)) throw new Error(`Invalid number: ${s}`);
 
-    if (current && online.some((d) => d.deviceId === current))
-      selEl.value = current;
+  if (n >= 0 && n <= 1) return { value: n, unit: "pct" };
+  return { value: n, unit: "px" };
+}
 
-    if (!online.length) {
-      selEl.innerHTML = `<option value="">(Không có thiết bị ONLINE)</option>`;
-    }
+function mustSelected() {
+  if (!selectedDeviceId) throw new Error("Chưa chọn thiết bị");
+  const d = devicesById.get(selectedDeviceId);
+  if (!d) throw new Error("Thiết bị không tồn tại");
+  if (d.state !== "ONLINE")
+    throw new Error(`Thiết bị không ONLINE (${d.state})`);
+  return selectedDeviceId;
+}
+
+async function act(name, fn) {
+  try {
+    await fn();
+    log(name);
+    refreshUI();
   } catch (e) {
-    listEl.innerHTML = `<li class="err">Lỗi: ${e.message}</li>`;
+    log(`${name} failed: ${e.message}`, true);
   }
 }
 
-function getSelectedDeviceId() {
-  const id = $("deviceSelect").value;
-  if (!id) throw new Error("Chưa có thiết bị ONLINE để điều khiển");
-  return id;
-}
+$("startAllBtn").addEventListener("click", async () => {
+  try {
+    const ids = await window.forgeAPI.scrcpyStartAll();
+    log(`StartAll: ${ids.length} devices`);
+  } catch (e) {
+    log(e.message, true);
+  }
+});
 
-async function ensureAgent(deviceId) {
-  await window.forgeAPI.agentPing(deviceId);
-}
+$("stopAllBtn").addEventListener("click", async () => {
+  try {
+    await window.forgeAPI.scrcpyStopAll();
+    autoStartPending.clear();
+    log("StopAll done");
+  } catch (e) {
+    log(e.message, true);
+  }
+});
 
-async function getSelectedDeviceSnapshot(deviceId) {
+$("startBtn").addEventListener("click", () =>
+  act("scrcpy start", async () => {
+    const id = mustSelected();
+    await window.forgeAPI.scrcpyStart(id);
+  })
+);
+
+$("stopBtn").addEventListener("click", () =>
+  act("scrcpy stop", async () => {
+    const id = mustSelected();
+    await window.forgeAPI.scrcpyStop(id);
+    autoStartPending.delete(id);
+  })
+);
+
+$("wakeBtn").addEventListener("click", () =>
+  act("wake", async () => {
+    const id = mustSelected();
+    await window.forgeAPI.wake(id);
+  })
+);
+
+$("homeBtn").addEventListener("click", () =>
+  act("home", async () => {
+    const id = mustSelected();
+    await window.forgeAPI.home(id);
+  })
+);
+
+$("backBtn").addEventListener("click", () =>
+  act("back", async () => {
+    const id = mustSelected();
+    await window.forgeAPI.back(id);
+  })
+);
+
+$("recentsBtn").addEventListener("click", () =>
+  act("recents", async () => {
+    const id = mustSelected();
+    await window.forgeAPI.recents(id);
+  })
+);
+
+$("swipeUpBtn").addEventListener("click", () =>
+  act("swipe up", async () => {
+    const id = mustSelected();
+    await window.forgeAPI.swipeDir(id, "up");
+  })
+);
+
+$("swipeDownBtn").addEventListener("click", () =>
+  act("swipe down", async () => {
+    const id = mustSelected();
+    await window.forgeAPI.swipeDir(id, "down");
+  })
+);
+
+$("swipeLeftBtn").addEventListener("click", () =>
+  act("swipe left", async () => {
+    const id = mustSelected();
+    await window.forgeAPI.swipeDir(id, "left");
+  })
+);
+
+$("swipeRightBtn").addEventListener("click", () =>
+  act("swipe right", async () => {
+    const id = mustSelected();
+    await window.forgeAPI.swipeDir(id, "right");
+  })
+);
+
+$("tapBtn").addEventListener("click", () =>
+  act("tap", async () => {
+    const id = mustSelected();
+    const x = parseHybrid($("tapX").value);
+    const y = parseHybrid($("tapY").value);
+    await window.forgeAPI.tapRaw(id, x, y);
+  })
+);
+
+$("swipeBtn").addEventListener("click", () =>
+  act("swipe raw", async () => {
+    const id = mustSelected();
+    const x1 = parseHybrid($("swX1").value);
+    const y1 = parseHybrid($("swY1").value);
+    const x2 = parseHybrid($("swX2").value);
+    const y2 = parseHybrid($("swY2").value);
+    const dur = Number($("swDur").value || 220);
+    await window.forgeAPI.swipeRaw(id, x1, y1, x2, y2, dur);
+  })
+);
+
+// ===== refresh loop =====
+async function refreshUI() {
   const devices = await window.forgeAPI.listDevices();
-  return devices.find((x) => x.deviceId === deviceId) || null;
-}
 
-function mustHaveResolution(d) {
-  if (!d || !d.resolution)
-    throw new Error("Chưa có resolution (đợi 1-2s rồi thử lại)");
-  return d.resolution;
-}
+  devicesById.clear();
+  for (const d of devices) devicesById.set(d.deviceId, d);
 
-// ===== Core1 buttons =====
-async function tapCenter() {
-  const deviceId = getSelectedDeviceId();
-  await ensureAgent(deviceId);
-
-  const d = await getSelectedDeviceSnapshot(deviceId);
-  const res = mustHaveResolution(d);
-
-  const x = Math.floor(res.width / 2);
-  const y = Math.floor(res.height / 2);
-
-  await window.forgeAPI.tap(deviceId, x, y);
-  log(`Tap center on ${deviceId} at ${x},${y}`);
-}
-
-async function longPressCenter() {
-  const deviceId = getSelectedDeviceId();
-  await ensureAgent(deviceId);
-
-  const d = await getSelectedDeviceSnapshot(deviceId);
-  const res = mustHaveResolution(d);
-
-  const x = Math.floor(res.width / 2);
-  const y = Math.floor(res.height / 2);
-
-  await window.forgeAPI.longPress(deviceId, x, y, 700);
-  log(`Long press center on ${deviceId} at ${x},${y}`);
-}
-
-async function swipeUp() {
-  const deviceId = getSelectedDeviceId();
-  await ensureAgent(deviceId);
-
-  const d = await getSelectedDeviceSnapshot(deviceId);
-  const res = mustHaveResolution(d);
-
-  const x = Math.floor(res.width / 2);
-  const y1 = Math.floor(res.height * 0.7);
-  const y2 = Math.floor(res.height * 0.3);
-
-  await window.forgeAPI.swipe(deviceId, x, y1, x, y2, 240);
-  log(`Swipe UP on ${deviceId} from ${x},${y1} to ${x},${y2}`);
-}
-
-async function swipeDown() {
-  const deviceId = getSelectedDeviceId();
-  await ensureAgent(deviceId);
-
-  const d = await getSelectedDeviceSnapshot(deviceId);
-  const res = mustHaveResolution(d);
-
-  const x = Math.floor(res.width / 2);
-  const y1 = Math.floor(res.height * 0.3);
-  const y2 = Math.floor(res.height * 0.7);
-
-  await window.forgeAPI.swipe(deviceId, x, y1, x, y2, 240);
-  log(`Swipe DOWN on ${deviceId} from ${x},${y1} to ${x},${y2}`);
-}
-
-function parseIntStrict(v) {
-  const n = Number(String(v).trim());
-  if (!Number.isFinite(n)) return null;
-  return Math.floor(n);
-}
-
-async function tapXY() {
-  const deviceId = getSelectedDeviceId();
-  await ensureAgent(deviceId);
-
-  const d = await getSelectedDeviceSnapshot(deviceId);
-  const res = mustHaveResolution(d);
-
-  const x = parseIntStrict($("xInput").value);
-  const y = parseIntStrict($("yInput").value);
-
-  if (x === null || y === null) throw new Error("Nhập X/Y hợp lệ (số)");
-  if (x < 0 || y < 0 || x >= res.width || y >= res.height) {
-    throw new Error(
-      `X/Y ngoài màn hình. Resolution=${res.width}x${res.height}`
-    );
+  if (!selectedDeviceId) {
+    const firstOnline = devices.find((d) => d.state === "ONLINE");
+    if (firstOnline) selectedDeviceId = firstOnline.deviceId;
   }
 
-  await window.forgeAPI.tap(deviceId, x, y);
-  log(`Tap X,Y on ${deviceId} at ${x},${y}`);
-}
+  renderDevices(devices);
 
-// NEW: throttle để tránh spam crash
-let lastKeyAt = 0;
-async function backBtn() {
-  const now = Date.now();
-  if (now - lastKeyAt < 120) return;
-  lastKeyAt = now;
+  // ✅ FIX: AutoStart no spam, no duplicate starts
+  if ($("autoStartChk").checked) {
+    for (const d of devices) {
+      if (d.state !== "ONLINE") continue;
 
-  const deviceId = getSelectedDeviceId();
-  await ensureAgent(deviceId);
-  await window.forgeAPI.back(deviceId);
-  log(`Back on ${deviceId}`);
-}
+      // if start already in flight, skip
+      if (autoStartPending.has(d.deviceId)) continue;
 
-async function homeBtn() {
-  const now = Date.now();
-  if (now - lastKeyAt < 120) return;
-  lastKeyAt = now;
-
-  const deviceId = getSelectedDeviceId();
-  await ensureAgent(deviceId);
-  await window.forgeAPI.home(deviceId);
-  log(`Home on ${deviceId}`);
-}
-
-// ===== STREAM via desktop capture =====
-let currentCaptureStream = null;
-let streamingDeviceId = null;
-let deviceRes = null;
-
-let startingStream = false; // NEW lock
-
-function showOverlay(text) {
-  $("overlayText").innerText = text;
-  $("overlay").style.display = "flex";
-}
-
-function hideOverlay() {
-  $("overlay").style.display = "none";
-}
-
-async function waitForWindowSourceId(deviceId, timeoutMs = 12000) {
-  const needle = `forge:${deviceId}`;
-  const t0 = Date.now();
-
-  while (Date.now() - t0 < timeoutMs) {
-    const id = await window.forgeAPI.getWindowSourceIdByTitleContains(needle);
-    if (id) return id;
-    await new Promise((r) => setTimeout(r, 250));
-  }
-  return null;
-}
-
-async function attachCaptureToVideo(sourceId) {
-  const constraints = {
-    audio: false,
-    video: {
-      mandatory: {
-        chromeMediaSource: "desktop",
-        chromeMediaSourceId: sourceId,
-      },
-    },
-  };
-
-  const stream = await navigator.mediaDevices.getUserMedia(constraints);
-  const video = $("liveVideo");
-
-  if (currentCaptureStream) {
-    try {
-      currentCaptureStream.getTracks().forEach((t) => t.stop());
-    } catch {}
-    currentCaptureStream = null;
-  }
-
-  video.srcObject = stream;
-  await video.play();
-
-  const track = stream.getVideoTracks()[0];
-  if (track) {
-    track.onended = () => {
-      log("Capture ended (window closed/minimized)", true);
-      showOverlay("Stream ended (cửa sổ scrcpy bị đóng hoặc capture bị dừng).");
-    };
-  }
-
-  currentCaptureStream = stream;
-  return true;
-}
-
-async function startStream() {
-  if (startingStream) return;
-  startingStream = true;
-
-  const startBtn = $("startStreamBtn");
-  if (startBtn) startBtn.disabled = true;
-
-  try {
-    const deviceId = getSelectedDeviceId();
-    streamingDeviceId = deviceId;
-
-    hideOverlay();
-
-    await ensureAgent(deviceId);
-
-    const snap = await getSelectedDeviceSnapshot(deviceId);
-    deviceRes = mustHaveResolution(snap);
-
-    await window.forgeAPI.streamStart(deviceId);
-    log(`Stream start requested for ${deviceId}`);
-
-    const sourceId = await waitForWindowSourceId(deviceId, 14000);
-    if (!sourceId) {
-      showOverlay(`Không tìm thấy cửa sổ scrcpy (forge:${deviceId}).`);
-      throw new Error(
-        `Không tìm thấy window scrcpy với title chứa "forge:${deviceId}"`
-      );
-    }
-
-    await attachCaptureToVideo(sourceId);
-    log(`Captured scrcpy window for ${deviceId}`);
-  } finally {
-    startingStream = false;
-    if (startBtn) startBtn.disabled = false;
-  }
-}
-
-async function stopStream() {
-  const deviceId = streamingDeviceId || getSelectedDeviceId();
-
-  try {
-    await window.forgeAPI.streamStop(deviceId);
-  } catch {}
-
-  if (currentCaptureStream) {
-    try {
-      currentCaptureStream.getTracks().forEach((t) => t.stop());
-    } catch {}
-    currentCaptureStream = null;
-  }
-
-  $("liveVideo").srcObject = null;
-  streamingDeviceId = null;
-
-  showOverlay("Stream stopped.");
-  log(`Stream stopped`);
-}
-
-// ===== mapping click/drag trên video (letterbox aware) =====
-function getVideoContentRect(videoEl) {
-  const rect = videoEl.getBoundingClientRect();
-
-  const vw = videoEl.videoWidth || 0;
-  const vh = videoEl.videoHeight || 0;
-  if (!vw || !vh) return null;
-
-  const containerW = rect.width;
-  const containerH = rect.height;
-
-  const scale = Math.min(containerW / vw, containerH / vh);
-  const drawW = vw * scale;
-  const drawH = vh * scale;
-
-  const offsetX = (containerW - drawW) / 2;
-  const offsetY = (containerH - drawH) / 2;
-
-  return {
-    left: rect.left + offsetX,
-    top: rect.top + offsetY,
-    width: drawW,
-    height: drawH,
-    vw,
-    vh,
-  };
-}
-
-function clientToDeviceXY(ev) {
-  if (!deviceRes) throw new Error("Chưa có device resolution");
-  const video = $("liveVideo");
-  const r = getVideoContentRect(video);
-  if (!r) throw new Error("Chưa có frame video (đợi 1-2s)");
-
-  const cx = ev.clientX;
-  const cy = ev.clientY;
-
-  if (
-    cx < r.left ||
-    cx > r.left + r.width ||
-    cy < r.top ||
-    cy > r.top + r.height
-  ) {
-    return null;
-  }
-
-  const rx = (cx - r.left) / r.width;
-  const ry = (cy - r.top) / r.height;
-
-  const dx = Math.max(
-    0,
-    Math.min(deviceRes.width - 1, Math.round(rx * deviceRes.width))
-  );
-  const dy = Math.max(
-    0,
-    Math.min(deviceRes.height - 1, Math.round(ry * deviceRes.height))
-  );
-
-  return { x: dx, y: dy, rx, ry };
-}
-
-let dragging = false;
-let dragStart = null;
-
-function wireLiveInteraction() {
-  const video = $("liveVideo");
-
-  video.addEventListener("mousedown", (ev) => {
-    const p = clientToDeviceXY(ev);
-    if (!p) return;
-    dragging = true;
-    dragStart = p;
-  });
-
-  window.addEventListener("mouseup", async (ev) => {
-    if (!dragging) return;
-    dragging = false;
-
-    try {
-      const deviceId = getSelectedDeviceId();
-      await ensureAgent(deviceId);
-
-      const end = clientToDeviceXY(ev);
-      if (!end) return;
-
-      const dx = Math.abs(end.x - dragStart.x);
-      const dy = Math.abs(end.y - dragStart.y);
-
-      if (dx < 10 && dy < 10) {
-        await window.forgeAPI.tap(deviceId, dragStart.x, dragStart.y);
-        log(
-          `Tap from LiveScreen ${Math.round(dragStart.rx * 100)}%,${Math.round(dragStart.ry * 100)}%`
-        );
-        return;
+      try {
+        const running = await window.forgeAPI.scrcpyIsRunning(d.deviceId);
+        if (!running) {
+          autoStartPending.add(d.deviceId);
+          await window.forgeAPI.scrcpyStart(d.deviceId);
+        }
+      } catch {
+        // ignore
+      } finally {
+        // release pending shortly; if start fails it can retry next loop
+        setTimeout(() => autoStartPending.delete(d.deviceId), 1200);
       }
-
-      await window.forgeAPI.swipe(
-        deviceId,
-        dragStart.x,
-        dragStart.y,
-        end.x,
-        end.y,
-        220
-      );
-      log(
-        `Swipe from LiveScreen ${Math.round(dragStart.rx * 100)}%,${Math.round(dragStart.ry * 100)}% -> ${Math.round(end.rx * 100)}%,${Math.round(end.ry * 100)}%`
-      );
-    } catch (e) {
-      log(e.message, true);
-    } finally {
-      dragStart = null;
     }
-  });
+  }
+
+  await updateSelectedInfo();
 }
 
-function wireUI() {
-  $("tapCenterBtn").addEventListener("click", async () => {
-    try {
-      await tapCenter();
-    } catch (e) {
-      log(e.message, true);
-    }
-  });
+window.forgeAPI.onScrcpyClosed(({ deviceId, code, signal }) => {
+  autoStartPending.delete(deviceId);
+  log(
+    `scrcpy closed: ${deviceId} (code=${code ?? "?"}, signal=${signal ?? "?"})`,
+    true
+  );
+  refreshUI();
+});
 
-  $("longPressCenterBtn").addEventListener("click", async () => {
-    try {
-      await longPressCenter();
-    } catch (e) {
-      log(e.message, true);
-    }
-  });
-
-  $("swipeUpBtn").addEventListener("click", async () => {
-    try {
-      await swipeUp();
-    } catch (e) {
-      log(e.message, true);
-    }
-  });
-
-  $("swipeDownBtn").addEventListener("click", async () => {
-    try {
-      await swipeDown();
-    } catch (e) {
-      log(e.message, true);
-    }
-  });
-
-  $("tapXYBtn").addEventListener("click", async () => {
-    try {
-      await tapXY();
-    } catch (e) {
-      log(e.message, true);
-    }
-  });
-
-  $("backBtn").addEventListener("click", async () => {
-    try {
-      await backBtn();
-    } catch (e) {
-      log(e.message, true);
-    }
-  });
-
-  $("homeBtn").addEventListener("click", async () => {
-    try {
-      await homeBtn();
-    } catch (e) {
-      log(e.message, true);
-    }
-  });
-
-  $("yInput").addEventListener("keydown", (ev) => {
-    if (ev.key === "Enter") $("tapXYBtn").click();
-  });
-
-  $("startStreamBtn").addEventListener("click", async () => {
-    try {
-      await startStream();
-    } catch (e) {
-      log(e.message, true);
-      showOverlay(e.message);
-    }
-  });
-
-  $("stopStreamBtn").addEventListener("click", async () => {
-    try {
-      await stopStream();
-    } catch (e) {
-      log(e.message, true);
-    }
-  });
-
-  $("overlayStartBtn").addEventListener("click", async () => {
-    try {
-      await startStream();
-    } catch (e) {
-      log(e.message, true);
-      showOverlay(e.message);
-    }
-  });
-
-  window.forgeAPI.onStreamEnded(({ deviceId }) => {
-    if (streamingDeviceId && deviceId === streamingDeviceId) {
-      log(`scrcpy closed for ${deviceId}`, true);
-      showOverlay(
-        "Stream ended (scrcpy đã bị đóng). Bấm Start Stream để chạy lại."
-      );
-    }
-  });
-}
-
-wireUI();
-wireLiveInteraction();
-refreshDevices();
-setInterval(refreshDevices, 1500);
-showOverlay("Chưa stream. Bấm Start Stream.");
+(async function boot() {
+  log(
+    "Control Panel loaded. scrcpy windows are direct (no Electron streaming)."
+  );
+  await refreshUI();
+  setInterval(refreshUI, 1500);
+})();

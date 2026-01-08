@@ -4,6 +4,10 @@ const { contextBridge, ipcRenderer } = require("electron");
 contextBridge.exposeInMainWorld("forgeAPI", {
   listDevices: () => ipcRenderer.invoke("devices:list"),
 
+  // layout
+  getLayout: () => ipcRenderer.invoke("layout:get"),
+  setLayout: (patch) => ipcRenderer.invoke("layout:set", patch),
+
   // scrcpy
   scrcpyStart: (deviceId) => ipcRenderer.invoke("scrcpy:start", { deviceId }),
   scrcpyStop: (deviceId) => ipcRenderer.invoke("scrcpy:stop", { deviceId }),
@@ -11,6 +15,9 @@ contextBridge.exposeInMainWorld("forgeAPI", {
     ipcRenderer.invoke("scrcpy:isRunning", { deviceId }),
   scrcpyStartAll: () => ipcRenderer.invoke("scrcpy:startAll"),
   scrcpyStopAll: () => ipcRenderer.invoke("scrcpy:stopAll"),
+  scrcpyApplyLayout: (payload) =>
+    ipcRenderer.invoke("scrcpy:applyLayout", payload),
+
   onScrcpyClosed: (cb) => {
     ipcRenderer.on("scrcpy:closed", (_, payload) => cb(payload));
   },

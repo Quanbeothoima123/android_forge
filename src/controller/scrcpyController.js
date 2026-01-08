@@ -38,16 +38,26 @@ class ScrcpyController extends EventEmitter {
       const bitRate = opts.bitRate ?? "8M";
 
       const win = opts.window || {};
-      // IMPORTANT: borderless=false => allow user resize
+      // IMPORTANT: borderless=false => allow user resize (Windows frame)
       const borderless = win.borderless === true ? true : false;
       const alwaysOnTop = !!win.alwaysOnTop;
 
+      // used for:
+      // - initial window size (scrcpy --window-width/--window-height)
+      // - grid cell calculation in PS
       const targetW = Number.isFinite(win.width) ? Number(win.width) : 360;
       const targetH = Number.isFinite(win.height) ? Number(win.height) : 800;
 
       const corner = win.corner || "top-left";
       const margin = Number.isFinite(win.margin) ? Number(win.margin) : 8;
-      const layout = win.layout || null; // { mode:'grid', slotIndex }
+
+      // layout supports:
+      // { mode:'grid'|'corner', slotIndex, cols?, rows?, margin? }
+      const layout = win.layout || null;
+
+      // scale/perf:
+      // - maxSize: scrcpy -m => limits decoded video size => lighter GPU
+      const maxSize = Number.isFinite(win.maxSize) ? Number(win.maxSize) : null;
 
       const args = [
         "-s",
@@ -59,8 +69,21 @@ class ScrcpyController extends EventEmitter {
         String(maxFps),
         "--video-bit-rate",
         String(bitRate),
-        // DO NOT set --window-width/--window-height => user can resize naturally
       ];
+
+      // ✅ scale/perf: limit video decode size (does not lock window resizing)
+      if (maxSize && maxSize >= 120) {
+        args.push("-m", String(Math.round(maxSize)));
+      }
+
+      // ✅ initial window size (still user-resizable)
+      // This is NOT like MoveWindow force; it's only initial size on spawn.
+      if (Number.isFinite(targetW) && targetW >= 120) {
+        args.push("--window-width", String(Math.round(targetW)));
+      }
+      if (Number.isFinite(targetH) && targetH >= 200) {
+        args.push("--window-height", String(Math.round(targetH)));
+      }
 
       // ---- FIX: use a single explicit port per device, not a range string
       if (Number.isFinite(opts.port)) args.push("--port", String(opts.port));
@@ -91,31 +114,52 @@ class ScrcpyController extends EventEmitter {
       this.procs.set(deviceId, { proc, title, port: opts.port });
 
       const rules = {
-        // used only for grid cell calculation (not forcing actual size)
+        // used for grid cell calculation (and optional resize on apply-layout)
         width: targetW,
         height: targetH,
+
+        // backward compatible corner layout
         corner,
         margin,
-        layoutMode: layout?.mode || "corner",
+
+        // new layout
+        layoutMode: layout?.mode || "corner", // 'grid' | 'corner'
         slotIndex:
           layout?.mode === "grid" && Number.isFinite(layout?.slotIndex)
             ? Number(layout.slotIndex)
             : 0,
+
+        // fixed grid
+        cols:
+          layout?.mode === "grid" && Number.isFinite(layout?.cols)
+            ? Number(layout.cols)
+            : null,
+        rows:
+          layout?.mode === "grid" && Number.isFinite(layout?.rows)
+            ? Number(layout.rows)
+            : null,
+
+        // z-order rules
         sendToBottom: !!(opts.zOrder && opts.zOrder.sendToBottom),
         noActivate: !!(opts.zOrder && opts.zOrder.noActivate),
+
+        // IMPORTANT:
+        // when start => DO NOT force size via WinAPI (allow user resize)
+        // (applyLayout can force size by passing forceSize=true)
+        forceSize: false,
+
         timeoutMs: Number.isFinite(win.timeoutMs)
           ? Number(win.timeoutMs)
           : 15000,
       };
 
-      // Apply window positioning asynchronously
+      // Apply positioning asynchronously
       this._applyWindowRulesByTitle(title, rules).catch((e) => {
         console.log("[scrcpy window rules] failed:", e.message);
       });
 
       return true;
     } finally {
-      // release quickly; start is fire-and-forget
       this.pendingStart.delete(deviceId);
     }
   }
@@ -137,7 +181,6 @@ class ScrcpyController extends EventEmitter {
             windowsHide: true,
             stdio: "ignore",
           });
-          // give taskkill a moment
           await sleep(80);
         } catch {}
       } else {
@@ -159,6 +202,63 @@ class ScrcpyController extends EventEmitter {
     }
   }
 
+  /**
+   * Apply layout to currently running scrcpy windows (no restart).
+   * items: [{ deviceId, title, slotIndex }]
+   * layout: { mode:'grid', cols, rows, margin }
+   * cell: { width, height }   (used for grid spacing, and optional force resize)
+   * options: { forceSize:boolean, sendToBottom:boolean, noActivate:boolean, timeoutMs:number }
+   */
+  async applyLayout(items, layout, cell, options = {}) {
+    if (!Array.isArray(items) || items.length === 0) return true;
+
+    const mode = layout?.mode || "grid";
+    const cols = Number.isFinite(layout?.cols) ? Number(layout.cols) : null;
+    const rows = Number.isFinite(layout?.rows) ? Number(layout.rows) : null;
+    const margin = Number.isFinite(layout?.margin) ? Number(layout.margin) : 8;
+
+    const width = Number.isFinite(cell?.width) ? Number(cell.width) : 360;
+    const height = Number.isFinite(cell?.height) ? Number(cell.height) : 800;
+
+    const sendToBottom = !!options.sendToBottom;
+    const noActivate = !!options.noActivate;
+    const timeoutMs = Number.isFinite(options.timeoutMs)
+      ? Number(options.timeoutMs)
+      : 15000;
+    const forceSize = !!options.forceSize;
+
+    // do sequential to avoid too many PS at once
+    for (const it of items) {
+      const title = it?.title;
+      if (!title) continue;
+
+      const rules = {
+        width,
+        height,
+        margin,
+        corner: "top-left",
+        layoutMode: mode,
+        slotIndex: Number.isFinite(it.slotIndex) ? Number(it.slotIndex) : 0,
+        cols,
+        rows,
+        sendToBottom,
+        noActivate,
+        forceSize,
+        timeoutMs,
+      };
+
+      try {
+        await this._applyWindowRulesByTitle(title, rules);
+      } catch (e) {
+        console.log("[applyLayout] failed:", title, e.message);
+      }
+
+      await sleep(35);
+    }
+
+    return true;
+  }
+
   _applyWindowRulesByTitle(title, rules) {
     const width = Number(rules.width || 360);
     const height = Number(rules.height || 800);
@@ -170,8 +270,12 @@ class ScrcpyController extends EventEmitter {
       ? Number(rules.slotIndex)
       : 0;
 
+    const cols = Number.isFinite(rules.cols) ? Number(rules.cols) : -1;
+    const rows = Number.isFinite(rules.rows) ? Number(rules.rows) : -1;
+
     const sendToBottom = !!rules.sendToBottom;
     const noActivate = !!rules.noActivate;
+    const forceSize = !!rules.forceSize; // if true => SetWindowPos with size
     const timeoutMs = Number(rules.timeoutMs || 15000);
 
     const ps = `
@@ -221,14 +325,17 @@ Add-Type -AssemblyName System.Windows.Forms | Out-Null
 $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
 
 $needle = ${JSON.stringify(title)}
-$w = ${width}
-$h = ${height}
-$m = ${margin}
+$w = ${Math.round(width)}
+$h = ${Math.round(height)}
+$m = ${Math.round(margin)}
 $corner = ${JSON.stringify(corner)}
 $layoutMode = ${JSON.stringify(layoutMode)}
 $slotIndex = ${slotIndex}
+$colsFixed = ${Number.isFinite(cols) ? cols : -1}
+$rowsFixed = ${Number.isFinite(rows) ? rows : -1}
 $sendToBottom = ${sendToBottom ? "$true" : "$false"}
 $noActivate = ${noActivate ? "$true" : "$false"}
+$forceSize = ${forceSize ? "$true" : "$false"}
 $timeoutMs = ${timeoutMs}
 
 $deadline = (Get-Date).AddMilliseconds($timeoutMs)
@@ -239,24 +346,36 @@ while ((Get-Date) -lt $deadline -and $hwnd -eq [IntPtr]::Zero) {
 }
 if ($hwnd -eq [IntPtr]::Zero) { exit 0 }
 
-# Move only (do not resize) => user can resize freely
+# default pos
 $X = $wa.Left + $m
 $Y = $wa.Top  + $m
 
 if ($layoutMode -eq "grid") {
-  $cols = [Math]::Floor(($wa.Width - $m) / ($w + $m))
-  if ($cols -lt 1) { $cols = 1 }
+  # fixed cols/rows if provided, else auto-calc cols by WA width
+  $cols = $colsFixed
+  if ($cols -lt 1) {
+    $cols = [Math]::Floor(($wa.Width - $m) / ($w + $m))
+    if ($cols -lt 1) { $cols = 1 }
+  }
 
   $col = $slotIndex % $cols
   $row = [Math]::Floor($slotIndex / $cols)
 
+  # if rows provided, we still compute row; optional clamp to last row
+  if ($rowsFixed -ge 1 -and $row -ge $rowsFixed) {
+    # keep within rows by pinning to last row (so it doesn't go too far)
+    $row = $rowsFixed - 1
+  }
+
   $X = $wa.Left + $m + ($col * ($w + $m))
   $Y = $wa.Top  + $m + ($row * ($h + $m))
 
-  if ($Y + 220 + $m -gt $wa.Bottom) {
-    $Y = [Math]::Max($wa.Top + $m, $wa.Bottom - 240 - $m)
+  # clamp Y if exceeds bottom (best-effort)
+  if ($Y + 120 + $m -gt $wa.Bottom) {
+    $Y = [Math]::Max($wa.Top + $m, $wa.Bottom - 160 - $m)
   }
 } else {
+  # corner layout
   if ($corner -eq "top-left") {
     $X = $wa.Left + $m; $Y = $wa.Top + $m
   } elseif ($corner -eq "top-right") {
@@ -268,10 +387,16 @@ if ($layoutMode -eq "grid") {
   }
 }
 
-$flagsMoveOnly = [Win32]::SWP_NOSIZE -bor [Win32]::SWP_SHOWWINDOW
-if ($noActivate) { $flagsMoveOnly = $flagsMoveOnly -bor [Win32]::SWP_NOACTIVATE }
-
-[void][Win32]::SetWindowPos($hwnd, [Win32]::HWND_TOP, $X, $Y, 0, 0, $flagsMoveOnly)
+# Apply move (and optional resize)
+if ($forceSize) {
+  $flags = [Win32]::SWP_SHOWWINDOW
+  if ($noActivate) { $flags = $flags -bor [Win32]::SWP_NOACTIVATE }
+  [void][Win32]::SetWindowPos($hwnd, [Win32]::HWND_TOP, $X, $Y, $w, $h, $flags)
+} else {
+  $flagsMoveOnly = [Win32]::SWP_NOSIZE -bor [Win32]::SWP_SHOWWINDOW
+  if ($noActivate) { $flagsMoveOnly = $flagsMoveOnly -bor [Win32]::SWP_NOACTIVATE }
+  [void][Win32]::SetWindowPos($hwnd, [Win32]::HWND_TOP, $X, $Y, 0, 0, $flagsMoveOnly)
+}
 
 if ($sendToBottom) {
   $flagsBottom = [Win32]::SWP_NOMOVE -bor [Win32]::SWP_NOSIZE -bor [Win32]::SWP_SHOWWINDOW

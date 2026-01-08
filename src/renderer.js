@@ -132,8 +132,58 @@ async function act(name, fn) {
   }
 }
 
+// ===== Layout UI sync =====
+function readLayoutFromUI() {
+  const scalePct = Number($("scaleSel").value || 50);
+  const cols = Number($("gridCols").value || 4);
+  const rows = Number($("gridRows").value || 0);
+  const margin = Number($("gridMargin").value || 8);
+  const forceResizeOnApply = !!$("forceResizeChk").checked;
+
+  return { scalePct, cols, rows, margin, forceResizeOnApply };
+}
+
+async function pushLayoutToMain() {
+  const patch = readLayoutFromUI();
+  try {
+    await window.forgeAPI.setLayout(patch);
+  } catch {}
+}
+
+async function pullLayoutFromMain() {
+  try {
+    const cfg = await window.forgeAPI.getLayout();
+    if (!cfg) return;
+
+    $("scaleSel").value = String(cfg.scalePct ?? 50);
+    $("gridCols").value = String(cfg.cols ?? 4);
+    $("gridRows").value = String(cfg.rows ?? 0);
+    $("gridMargin").value = String(cfg.margin ?? 8);
+    $("forceResizeChk").checked = !!cfg.forceResizeOnApply;
+  } catch {}
+}
+
+["scaleSel", "gridCols", "gridRows", "gridMargin", "forceResizeChk"].forEach(
+  (id) => {
+    $(id).addEventListener("change", () => pushLayoutToMain());
+    $(id).addEventListener("input", () => pushLayoutToMain());
+  }
+);
+
+$("applyLayoutBtn").addEventListener("click", () =>
+  act("apply layout", async () => {
+    // forceResize uses checkbox
+    const forceResize = !!$("forceResizeChk").checked;
+    const r = await window.forgeAPI.scrcpyApplyLayout({ forceResize });
+    log(
+      `Apply layout: ${r?.count ?? "?"} windows (forceResize=${r?.forceResize ?? forceResize})`
+    );
+  })
+);
+
 $("startAllBtn").addEventListener("click", async () => {
   try {
+    await pushLayoutToMain();
     const ids = await window.forgeAPI.scrcpyStartAll();
     log(`StartAll: ${ids.length} devices`);
   } catch (e) {
@@ -153,6 +203,7 @@ $("stopAllBtn").addEventListener("click", async () => {
 
 $("startBtn").addEventListener("click", () =>
   act("scrcpy start", async () => {
+    await pushLayoutToMain();
     const id = mustSelected();
     await window.forgeAPI.scrcpyStart(id);
   })
@@ -257,24 +308,22 @@ async function refreshUI() {
 
   renderDevices(devices);
 
-  // ✅ FIX: AutoStart no spam, no duplicate starts
+  // ✅ AutoStart no spam, no duplicate starts
   if ($("autoStartChk").checked) {
     for (const d of devices) {
       if (d.state !== "ONLINE") continue;
-
-      // if start already in flight, skip
       if (autoStartPending.has(d.deviceId)) continue;
 
       try {
         const running = await window.forgeAPI.scrcpyIsRunning(d.deviceId);
         if (!running) {
           autoStartPending.add(d.deviceId);
+          await pushLayoutToMain();
           await window.forgeAPI.scrcpyStart(d.deviceId);
         }
       } catch {
         // ignore
       } finally {
-        // release pending shortly; if start fails it can retry next loop
         setTimeout(() => autoStartPending.delete(d.deviceId), 1200);
       }
     }
@@ -296,6 +345,7 @@ window.forgeAPI.onScrcpyClosed(({ deviceId, code, signal }) => {
   log(
     "Control Panel loaded. scrcpy windows are direct (no Electron streaming)."
   );
+  await pullLayoutFromMain();
   await refreshUI();
   setInterval(refreshUI, 1500);
 })();

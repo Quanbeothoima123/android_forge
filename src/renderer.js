@@ -20,8 +20,80 @@ function fmtRes(d) {
 let selectedDeviceId = "";
 const devicesById = new Map();
 
-// ===== FIX: prevent autostart spamming =====
-const autoStartPending = new Set(); // deviceId
+// ===== AutoStart anti-spam =====
+const autoStartPending = new Set();
+
+// ===== Layout state (from main) =====
+let layoutState = {
+  scalePct: 50,
+  cols: 4,
+  rows: 0,
+  margin: 8,
+  forceResizeOnApply: true,
+  deviceOrder: [],
+};
+
+// Drag reorder local working list (device ids in UI order)
+let uiOrder = [];
+
+async function pullLayoutFromMain() {
+  try {
+    const cfg = await window.forgeAPI.getLayout();
+    if (!cfg) return;
+
+    layoutState = { ...layoutState, ...cfg };
+
+    $("scaleSel").value = String(layoutState.scalePct ?? 50);
+    $("gridCols").value = String(layoutState.cols ?? 4);
+    $("gridRows").value = String(layoutState.rows ?? 0);
+    $("gridMargin").value = String(layoutState.margin ?? 8);
+    $("forceResizeChk").checked = !!layoutState.forceResizeOnApply;
+
+    if (Array.isArray(layoutState.deviceOrder)) {
+      uiOrder = [...layoutState.deviceOrder];
+    }
+  } catch {}
+}
+
+function readLayoutFromUI() {
+  const scalePct = Number($("scaleSel").value || 50);
+  const cols = Number($("gridCols").value || 4);
+  const rows = Number($("gridRows").value || 0);
+  const margin = Number($("gridMargin").value || 8);
+  const forceResizeOnApply = !!$("forceResizeChk").checked;
+  return { scalePct, cols, rows, margin, forceResizeOnApply };
+}
+
+async function pushLayoutToMain(extra = {}) {
+  const patch = { ...readLayoutFromUI(), ...extra };
+  try {
+    const cfg = await window.forgeAPI.setLayout(patch);
+    if (cfg) layoutState = { ...layoutState, ...cfg };
+  } catch {}
+}
+
+function ensureInUiOrder(devices) {
+  const existing = new Set(uiOrder);
+  for (const d of devices) {
+    if (!existing.has(d.deviceId)) uiOrder.push(d.deviceId);
+  }
+  // also remove ids that are gone (optional)
+  const alive = new Set(devices.map((d) => d.deviceId));
+  uiOrder = uiOrder.filter((id) => alive.has(id));
+}
+
+function sortDevicesForRender(devices) {
+  const idx = new Map();
+  uiOrder.forEach((id, i) => idx.set(id, i));
+  return [...devices].sort((a, b) => {
+    const ia = idx.has(a.deviceId) ? idx.get(a.deviceId) : 1e9;
+    const ib = idx.has(b.deviceId) ? idx.get(b.deviceId) : 1e9;
+    if (ia !== ib) return ia - ib;
+    return String(a.deviceId).localeCompare(String(b.deviceId));
+  });
+}
+
+let dragSrcId = "";
 
 function renderDevices(devices) {
   const wrap = $("devices");
@@ -32,11 +104,14 @@ function renderDevices(devices) {
     return;
   }
 
-  for (const d of devices) {
+  const list = sortDevicesForRender(devices);
+
+  for (const d of list) {
     const div = document.createElement("div");
     div.className =
       "deviceItem" + (d.deviceId === selectedDeviceId ? " selected" : "");
     div.dataset.deviceId = d.deviceId;
+    div.draggable = true;
 
     const badgeClass = d.agentReady ? "badge ok" : "badge bad";
     const badgeText = d.agentReady ? "READY" : "AGENT OFF";
@@ -65,6 +140,63 @@ function renderDevices(devices) {
       refreshUI();
     });
 
+    // drag & drop reorder
+    div.addEventListener("dragstart", (e) => {
+      dragSrcId = d.deviceId;
+      div.classList.add("dragging");
+      e.dataTransfer.effectAllowed = "move";
+      try {
+        e.dataTransfer.setData("text/plain", d.deviceId);
+      } catch {}
+    });
+
+    div.addEventListener("dragend", () => {
+      div.classList.remove("dragging");
+      dragSrcId = "";
+      // clear hints
+      for (const el of wrap.querySelectorAll(".deviceItem.dropHint")) {
+        el.classList.remove("dropHint");
+      }
+    });
+
+    div.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      div.classList.add("dropHint");
+      e.dataTransfer.dropEffect = "move";
+    });
+
+    div.addEventListener("dragleave", () => {
+      div.classList.remove("dropHint");
+    });
+
+    div.addEventListener("drop", async (e) => {
+      e.preventDefault();
+      div.classList.remove("dropHint");
+
+      const targetId = d.deviceId;
+      const srcId =
+        dragSrcId ||
+        (() => {
+          try {
+            return e.dataTransfer.getData("text/plain");
+          } catch {
+            return "";
+          }
+        })();
+
+      if (!srcId || srcId === targetId) return;
+
+      const from = uiOrder.indexOf(srcId);
+      const to = uiOrder.indexOf(targetId);
+      if (from < 0 || to < 0) return;
+
+      uiOrder.splice(from, 1);
+      uiOrder.splice(to, 0, srcId);
+
+      await pushLayoutToMain({ deviceOrder: uiOrder });
+      refreshUI();
+    });
+
     wrap.appendChild(div);
   }
 }
@@ -90,9 +222,7 @@ async function updateSelectedInfo() {
     const badge = $("runningBadge");
     badge.textContent = `RUNNING: ${running ? "YES" : "NO"}`;
     badge.className = "badge " + (running ? "ok" : "bad");
-  } catch {
-    // ignore
-  }
+  } catch {}
 }
 
 // ===== Hybrid parse =====
@@ -132,47 +262,21 @@ async function act(name, fn) {
   }
 }
 
-// ===== Layout UI sync =====
-function readLayoutFromUI() {
-  const scalePct = Number($("scaleSel").value || 50);
-  const cols = Number($("gridCols").value || 4);
-  const rows = Number($("gridRows").value || 0);
-  const margin = Number($("gridMargin").value || 8);
-  const forceResizeOnApply = !!$("forceResizeChk").checked;
-
-  return { scalePct, cols, rows, margin, forceResizeOnApply };
-}
-
-async function pushLayoutToMain() {
-  const patch = readLayoutFromUI();
-  try {
-    await window.forgeAPI.setLayout(patch);
-  } catch {}
-}
-
-async function pullLayoutFromMain() {
-  try {
-    const cfg = await window.forgeAPI.getLayout();
-    if (!cfg) return;
-
-    $("scaleSel").value = String(cfg.scalePct ?? 50);
-    $("gridCols").value = String(cfg.cols ?? 4);
-    $("gridRows").value = String(cfg.rows ?? 0);
-    $("gridMargin").value = String(cfg.margin ?? 8);
-    $("forceResizeChk").checked = !!cfg.forceResizeOnApply;
-  } catch {}
-}
-
+// ===== Layout controls =====
 ["scaleSel", "gridCols", "gridRows", "gridMargin", "forceResizeChk"].forEach(
   (id) => {
-    $(id).addEventListener("change", () => pushLayoutToMain());
-    $(id).addEventListener("input", () => pushLayoutToMain());
+    $(id).addEventListener("change", () =>
+      pushLayoutToMain({ deviceOrder: uiOrder })
+    );
+    $(id).addEventListener("input", () =>
+      pushLayoutToMain({ deviceOrder: uiOrder })
+    );
   }
 );
 
 $("applyLayoutBtn").addEventListener("click", () =>
   act("apply layout", async () => {
-    // forceResize uses checkbox
+    await pushLayoutToMain({ deviceOrder: uiOrder });
     const forceResize = !!$("forceResizeChk").checked;
     const r = await window.forgeAPI.scrcpyApplyLayout({ forceResize });
     log(
@@ -183,7 +287,7 @@ $("applyLayoutBtn").addEventListener("click", () =>
 
 $("startAllBtn").addEventListener("click", async () => {
   try {
-    await pushLayoutToMain();
+    await pushLayoutToMain({ deviceOrder: uiOrder });
     const ids = await window.forgeAPI.scrcpyStartAll();
     log(`StartAll: ${ids.length} devices`);
   } catch (e) {
@@ -203,7 +307,7 @@ $("stopAllBtn").addEventListener("click", async () => {
 
 $("startBtn").addEventListener("click", () =>
   act("scrcpy start", async () => {
-    await pushLayoutToMain();
+    await pushLayoutToMain({ deviceOrder: uiOrder });
     const id = mustSelected();
     await window.forgeAPI.scrcpyStart(id);
   })
@@ -301,6 +405,8 @@ async function refreshUI() {
   devicesById.clear();
   for (const d of devices) devicesById.set(d.deviceId, d);
 
+  ensureInUiOrder(devices);
+
   if (!selectedDeviceId) {
     const firstOnline = devices.find((d) => d.state === "ONLINE");
     if (firstOnline) selectedDeviceId = firstOnline.deviceId;
@@ -308,7 +414,7 @@ async function refreshUI() {
 
   renderDevices(devices);
 
-  // ✅ AutoStart no spam, no duplicate starts
+  // AutoStart no spam
   if ($("autoStartChk").checked) {
     for (const d of devices) {
       if (d.state !== "ONLINE") continue;
@@ -318,7 +424,7 @@ async function refreshUI() {
         const running = await window.forgeAPI.scrcpyIsRunning(d.deviceId);
         if (!running) {
           autoStartPending.add(d.deviceId);
-          await pushLayoutToMain();
+          await pushLayoutToMain({ deviceOrder: uiOrder });
           await window.forgeAPI.scrcpyStart(d.deviceId);
         }
       } catch {

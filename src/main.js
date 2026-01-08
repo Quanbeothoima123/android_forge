@@ -1,6 +1,7 @@
 // src/main.js
 const { app, BrowserWindow, ipcMain } = require("electron");
 const path = require("path");
+const fs = require("fs");
 
 const { DeviceRegistry } = require("./controller/deviceRegistry");
 const { scrcpy } = require("./controller/scrcpyController");
@@ -13,7 +14,138 @@ if (require("electron-squirrel-startup")) {
 const registry = new DeviceRegistry();
 let mainWindow = null;
 
-// ===== slot layout manager (grid) =====
+// ===== settings persistence =====
+function settingsPath() {
+  return path.join(app.getPath("userData"), "settings.json");
+}
+
+function readSettingsFile() {
+  try {
+    const p = settingsPath();
+    if (!fs.existsSync(p)) return null;
+    const raw = fs.readFileSync(p, "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function writeSettingsFile(obj) {
+  try {
+    const p = settingsPath();
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, JSON.stringify(obj, null, 2), "utf8");
+  } catch {}
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function clampInt(n, min, max) {
+  const v = Math.round(Number(n));
+  if (!Number.isFinite(v)) return min;
+  return Math.max(min, Math.min(max, v));
+}
+
+function normalizeScalePct(pct) {
+  const p = Number(pct);
+  if (!Number.isFinite(p)) return 50;
+  const allowed = [25, 50, 75, 100]; // ✅ remove 125
+  let best = allowed[0];
+  let bestDist = Math.abs(p - best);
+  for (const a of allowed) {
+    const d = Math.abs(p - a);
+    if (d < bestDist) {
+      best = a;
+      bestDist = d;
+    }
+  }
+  return best;
+}
+
+// ===== Device order (drag reorder) =====
+let deviceOrder = []; // array of deviceId (persisted)
+function setDeviceOrder(newOrder) {
+  if (!Array.isArray(newOrder)) return;
+  // keep only unique strings
+  const seen = new Set();
+  const cleaned = [];
+  for (const id of newOrder) {
+    const s = String(id || "").trim();
+    if (!s) continue;
+    if (seen.has(s)) continue;
+    seen.add(s);
+    cleaned.push(s);
+  }
+  deviceOrder = cleaned;
+}
+
+function sortDevicesByOrder(devices) {
+  const idx = new Map();
+  deviceOrder.forEach((id, i) => idx.set(id, i));
+  return [...devices].sort((a, b) => {
+    const ia = idx.has(a.deviceId) ? idx.get(a.deviceId) : 1e9;
+    const ib = idx.has(b.deviceId) ? idx.get(b.deviceId) : 1e9;
+    if (ia !== ib) return ia - ib;
+    return String(a.deviceId).localeCompare(String(b.deviceId));
+  });
+}
+
+// ===== layout config (persisted) =====
+const layoutConfig = {
+  scalePct: 50, // 25/50/75/100
+  cols: 4,
+  rows: 0, // 0 => no clamp
+  margin: 8,
+  forceResizeOnApply: true,
+};
+
+function getLayoutConfig() {
+  return {
+    ...layoutConfig,
+    deviceOrder,
+  };
+}
+
+function setLayoutConfig(patch = {}) {
+  if (patch.scalePct != null)
+    layoutConfig.scalePct = normalizeScalePct(patch.scalePct);
+
+  if (patch.cols != null) {
+    const c = Math.round(Number(patch.cols));
+    layoutConfig.cols = Number.isFinite(c)
+      ? Math.max(1, Math.min(20, c))
+      : layoutConfig.cols;
+  }
+
+  if (patch.rows != null) {
+    const r = Math.round(Number(patch.rows));
+    layoutConfig.rows = Number.isFinite(r)
+      ? Math.max(0, Math.min(20, r))
+      : layoutConfig.rows;
+  }
+
+  if (patch.margin != null) {
+    const m = Math.round(Number(patch.margin));
+    layoutConfig.margin = Number.isFinite(m)
+      ? Math.max(0, Math.min(60, m))
+      : layoutConfig.margin;
+  }
+
+  if (patch.forceResizeOnApply != null) {
+    layoutConfig.forceResizeOnApply = !!patch.forceResizeOnApply;
+  }
+
+  if (patch.deviceOrder != null) {
+    setDeviceOrder(patch.deviceOrder);
+  }
+
+  // persist immediately (best-effort)
+  writeSettingsFile({ v: 1, ...getLayoutConfig() });
+}
+
+// ===== slot manager (still used for stable per-device port, but slotIndex now follows UI order) =====
 const slotByDevice = new Map(); // deviceId -> slotIndex
 let nextSlot = 0;
 
@@ -28,15 +160,10 @@ function freeSlot(deviceId) {
   slotByDevice.delete(deviceId);
 }
 
-// ===== Layout config (from UI) =====
-// scalePct affects: scrcpy -m + initial --window-width/--window-height + grid cell size
-const layoutConfig = {
-  scalePct: 50, // 25/50/75/100/125
-  cols: 4,
-  rows: 0, // 0 => no clamp rows
-  margin: 8,
-  forceResizeOnApply: true, // Apply layout => resize windows to cell size
-};
+const SCRCPY_BASE_PORT = 27200;
+function portForSlot(slotIndex) {
+  return SCRCPY_BASE_PORT + (slotIndex % 200);
+}
 
 // ===== window =====
 function createWindow() {
@@ -61,21 +188,32 @@ function ensureOnline(ctx) {
   return ctx;
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-function clampInt(n, min, max) {
-  const v = Math.round(Number(n));
-  if (!Number.isFinite(v)) return min;
-  return Math.max(min, Math.min(max, v));
-}
-
 /**
- * Convert raw coordinate -> pixel
- * raw = { value: number, unit: 'px'|'pct' }
- * axisMax = res.width or res.height
+ * Compute initial window size & scrcpy maxSize from scale + device aspect.
+ * - baseW100 is farm base width at 100%.
  */
+function computeScrcpyCellAndMaxSize(deviceSnapshot, scalePct) {
+  const res = deviceSnapshot?.resolution;
+  const scale = normalizeScalePct(scalePct) / 100;
+
+  const baseW100 = 360;
+  const targetW = clampInt(baseW100 * scale, 160, 1200);
+
+  if (!res || !res.width || !res.height) {
+    const targetH = clampInt(780 * scale, 240, 1800);
+    const maxSize = clampInt(Math.max(targetW, targetH), 160, 2400);
+    return { width: targetW, height: targetH, maxSize };
+  }
+
+  const h = Math.round(targetW * (res.height / res.width));
+  const targetH = clampInt(h, 240, 2000);
+
+  const deviceMaxDim = Math.max(res.width, res.height);
+  const maxSize = clampInt(Math.round(deviceMaxDim * scale), 160, 6000);
+
+  return { width: targetW, height: targetH, maxSize };
+}
+
 function rawToPx(raw, axisMax) {
   if (!raw || !Number.isFinite(axisMax) || axisMax <= 0)
     throw new Error("Missing resolution to convert coordinates");
@@ -96,103 +234,22 @@ function rawToPx(raw, axisMax) {
   return clampInt(val, 0, axisMax - 1);
 }
 
-// ===== FIX: stable port allocator =====
-const SCRCPY_BASE_PORT = 27200;
-function portForSlot(slotIndex) {
-  return SCRCPY_BASE_PORT + (slotIndex % 200);
-}
-
-// ---- helpers: derive window cell size + scrcpy maxSize from scale ----
-function normalizeScalePct(pct) {
-  const p = Number(pct);
-  if (!Number.isFinite(p)) return 50;
-  const allowed = [25, 50, 75, 100, 125];
-  // snap to closest
-  let best = allowed[0];
-  let bestDist = Math.abs(p - best);
-  for (const a of allowed) {
-    const d = Math.abs(p - a);
-    if (d < bestDist) {
-      best = a;
-      bestDist = d;
-    }
-  }
-  return best;
-}
-
-/**
- * Decide initial window size for scrcpy and cell spacing.
- * - baseW is "farm friendly" width at 100% (you can tweak).
- * - scale multiplies baseW/baseH
- * - keep aspect from device resolution when available.
- */
-function computeScrcpyCellAndMaxSize(deviceSnapshot, scalePct) {
-  const res = deviceSnapshot?.resolution;
-  const scale = normalizeScalePct(scalePct) / 100;
-
-  const baseW100 = 360; // your farm base
-  const targetW = clampInt(baseW100 * scale, 160, 1200);
-
-  if (!res || !res.width || !res.height) {
-    const targetH = clampInt(780 * scale, 240, 1800);
-    // maxSize: use max dimension
-    const maxSize = clampInt(Math.max(targetW, targetH), 160, 2400);
-    return { width: targetW, height: targetH, maxSize };
-  }
-
-  const h = Math.round(targetW * (res.height / res.width));
-  const targetH = clampInt(h, 240, 2000);
-
-  // scrcpy -m is the "max render size" (max of width/height)
-  // we scale by same factor against device max dimension.
-  const deviceMaxDim = Math.max(res.width, res.height);
-  const maxSize = clampInt(Math.round(deviceMaxDim * scale), 160, 6000);
-
-  return { width: targetW, height: targetH, maxSize };
-}
-
-function getLayoutConfig() {
-  return {
-    scalePct: layoutConfig.scalePct,
-    cols: layoutConfig.cols,
-    rows: layoutConfig.rows,
-    margin: layoutConfig.margin,
-    forceResizeOnApply: layoutConfig.forceResizeOnApply,
-  };
-}
-
-function setLayoutConfig(patch = {}) {
-  if (patch.scalePct != null)
-    layoutConfig.scalePct = normalizeScalePct(patch.scalePct);
-
-  if (patch.cols != null) {
-    const c = Math.round(Number(patch.cols));
-    layoutConfig.cols = Number.isFinite(c)
-      ? Math.max(1, Math.min(20, c))
-      : layoutConfig.cols;
-  }
-
-  if (patch.rows != null) {
-    const r = Math.round(Number(patch.rows));
-    // 0 => no clamp; else 1..20
-    layoutConfig.rows = Number.isFinite(r)
-      ? Math.max(0, Math.min(20, r))
-      : layoutConfig.rows;
-  }
-
-  if (patch.margin != null) {
-    const m = Math.round(Number(patch.margin));
-    layoutConfig.margin = Number.isFinite(m)
-      ? Math.max(0, Math.min(60, m))
-      : layoutConfig.margin;
-  }
-
-  if (patch.forceResizeOnApply != null) {
-    layoutConfig.forceResizeOnApply = !!patch.forceResizeOnApply;
-  }
-}
-
 app.whenReady().then(() => {
+  // load settings once userData is available
+  const saved = readSettingsFile();
+  if (saved && typeof saved === "object") {
+    setDeviceOrder(saved.deviceOrder || []);
+    layoutConfig.scalePct = normalizeScalePct(
+      saved.scalePct ?? layoutConfig.scalePct
+    );
+    layoutConfig.cols = clampInt(saved.cols ?? layoutConfig.cols, 1, 20);
+    layoutConfig.rows = clampInt(saved.rows ?? layoutConfig.rows, 0, 20);
+    layoutConfig.margin = clampInt(saved.margin ?? layoutConfig.margin, 0, 60);
+    layoutConfig.forceResizeOnApply = !!(
+      saved.forceResizeOnApply ?? layoutConfig.forceResizeOnApply
+    );
+  }
+
   mainWindow = createWindow();
   registry.startPolling(1500);
 
@@ -203,7 +260,10 @@ app.whenReady().then(() => {
   });
 
   // ===== devices =====
-  ipcMain.handle("devices:list", async () => registry.listSnapshots());
+  ipcMain.handle("devices:list", async () => {
+    const list = registry.listSnapshots();
+    return sortDevicesByOrder(list);
+  });
 
   // ===== layout config =====
   ipcMain.handle("layout:get", async () => getLayoutConfig());
@@ -212,13 +272,26 @@ app.whenReady().then(() => {
     return getLayoutConfig();
   });
 
+  // helper: ensure device appears in deviceOrder (for new devices)
+  function ensureInOrder(deviceId) {
+    if (!deviceOrder.includes(deviceId)) {
+      deviceOrder.push(deviceId);
+      writeSettingsFile({ v: 1, ...getLayoutConfig() });
+    }
+  }
+
   // ===== scrcpy lifecycle =====
   ipcMain.handle("scrcpy:start", async (_, { deviceId }) => {
     const cfg = getLayoutConfig();
     const ctx = ensureOnline(registry.get(deviceId));
     const snap = ctx.snapshot();
 
-    const slotIndex = allocSlot(deviceId);
+    ensureInOrder(deviceId);
+
+    // slotIndex follows UI order (not alloc order)
+    const slotIndex = Math.max(0, deviceOrder.indexOf(deviceId));
+    // keep stable port mapping per slotIndex
+    allocSlot(deviceId);
     const port = portForSlot(slotIndex);
 
     const { width, height, maxSize } = computeScrcpyCellAndMaxSize(
@@ -241,7 +314,7 @@ app.whenReady().then(() => {
           rows: cfg.rows > 0 ? cfg.rows : null,
           margin: cfg.margin,
         },
-        borderless: false, // must be false for manual resize
+        borderless: false,
         alwaysOnTop: false,
         timeoutMs: 15000,
       },
@@ -261,18 +334,24 @@ app.whenReady().then(() => {
     return scrcpy.isRunning(deviceId);
   });
 
-  // startAll sequential + delay to avoid adb/scrcpy race
+  // StartAll uses UI order first
   ipcMain.handle("scrcpy:startAll", async () => {
     const cfg = getLayoutConfig();
     const online = registry.listSnapshots().filter((d) => d.state === "ONLINE");
+
+    // ensure all online devices are in order list
+    for (const d of online) ensureInOrder(d.deviceId);
+
+    const orderedOnline = sortDevicesByOrder(online);
     const started = [];
 
-    for (const d of online) {
+    for (const d of orderedOnline) {
       try {
         const ctx = ensureOnline(registry.get(d.deviceId));
         const snap = ctx.snapshot();
 
-        const slotIndex = allocSlot(d.deviceId);
+        const slotIndex = Math.max(0, deviceOrder.indexOf(d.deviceId));
+        allocSlot(d.deviceId);
         const port = portForSlot(slotIndex);
 
         const { width, height, maxSize } = computeScrcpyCellAndMaxSize(
@@ -320,10 +399,7 @@ app.whenReady().then(() => {
     return true;
   });
 
-  /**
-   * Apply layout to currently running windows without restart.
-   * payload: { forceResize?: boolean }
-   */
+  // Apply layout to running windows (order = deviceOrder)
   ipcMain.handle("scrcpy:applyLayout", async (_, payload = {}) => {
     const cfg = getLayoutConfig();
     const forceResize =
@@ -331,40 +407,27 @@ app.whenReady().then(() => {
         ? !!payload.forceResize
         : !!cfg.forceResizeOnApply;
 
-    // build running window list from scrcpyController internal map order:
-    // we want stable order by slotIndex (allocSlot)
-    const runningIds = [];
-    for (const d of registry.listSnapshots()) {
-      if (d.state !== "ONLINE") continue;
-      if (!scrcpy.isRunning(d.deviceId)) continue;
-      runningIds.push(d.deviceId);
-    }
-
-    // sort by slotIndex for stable grid
-    runningIds.sort(
-      (a, b) => (slotByDevice.get(a) ?? 1e9) - (slotByDevice.get(b) ?? 1e9)
+    const all = registry.listSnapshots();
+    const runningOnline = all.filter(
+      (d) => d.state === "ONLINE" && scrcpy.isRunning(d.deviceId)
     );
 
-    const items = runningIds.map((id) => {
-      const s = scrcpy.procs?.get ? scrcpy.procs.get(id) : null;
-      // NOTE: scrcpyController.procs is internal but exists in your class
-      // If future refactor hides it, we'd add a getter.
+    const ordered = sortDevicesByOrder(runningOnline);
+
+    const items = ordered.map((d, idx) => {
+      const s = scrcpy.procs.get(d.deviceId);
       return {
-        deviceId: id,
-        title: s?.title || `forge:${id}`,
-        slotIndex: allocSlot(id),
+        deviceId: d.deviceId,
+        title: s?.title || `forge:${d.deviceId}`,
+        slotIndex: Math.max(0, deviceOrder.indexOf(d.deviceId)),
       };
     });
 
-    // we need a representative cell size.
-    // Use first running device snapshot to compute, then apply same cell to all.
+    // use first running device to compute cell size
     let cell = { width: 360, height: 780, maxSize: 540 };
-    if (runningIds.length) {
-      const ctx = registry.get(runningIds[0]);
-      if (ctx) {
-        const snap = ctx.snapshot();
-        cell = computeScrcpyCellAndMaxSize(snap, cfg.scalePct);
-      }
+    if (ordered.length) {
+      const ctx = registry.get(ordered[0].deviceId);
+      if (ctx) cell = computeScrcpyCellAndMaxSize(ctx.snapshot(), cfg.scalePct);
     }
 
     await scrcpy.applyLayout(
@@ -408,7 +471,6 @@ app.whenReady().then(() => {
     return ctx.enqueue(() => input.wake(deviceId));
   });
 
-  // raw tap: {x:{value,unit}, y:{value,unit}}
   ipcMain.handle("control:tapRaw", async (_, { deviceId, x, y }) => {
     const ctx = ensureOnline(registry.get(deviceId));
     return ctx.enqueue(async () => {
@@ -424,7 +486,6 @@ app.whenReady().then(() => {
     });
   });
 
-  // raw swipe: x1,y1,x2,y2 are raw units
   ipcMain.handle("control:swipeRaw", async (_, payload) => {
     const ctx = ensureOnline(registry.get(payload.deviceId));
     return ctx.enqueue(async () => {
@@ -443,7 +504,6 @@ app.whenReady().then(() => {
     });
   });
 
-  // directional swipes by percent presets
   ipcMain.handle("control:swipeDir", async (_, { deviceId, dir }) => {
     const ctx = ensureOnline(registry.get(deviceId));
     return ctx.enqueue(async () => {
@@ -471,6 +531,11 @@ app.whenReady().then(() => {
 
       throw new Error("Unknown dir");
     });
+  });
+
+  app.on("before-quit", () => {
+    // best-effort save
+    writeSettingsFile({ v: 1, ...getLayoutConfig() });
   });
 
   app.on("activate", () => {

@@ -28,6 +28,8 @@
     "@yume-chan/adb-scrcpy": "^2.3.2",
     "electron-squirrel-startup": "^1.0.1",
     "ffmpeg-static": "^5.2.0",
+    "node-window-manager": "^2.2.4",
+    "uiohook-napi": "^1.5.4",
     "ws": "^8.18.0"
   }
 }

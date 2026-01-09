@@ -43,4 +43,29 @@ contextBridge.exposeInMainWorld("forgeAPI", {
 
   swipeDir: (deviceId, dir) =>
     ipcRenderer.invoke("control:swipeDir", { deviceId, dir }),
+
+  // ✅ macros
+  listMacros: () => ipcRenderer.invoke("macro:list"),
+  macroRecordStart: (deviceId) =>
+    ipcRenderer.invoke("macro:recordStart", { deviceId }),
+  macroRecordStop: () => ipcRenderer.invoke("macro:recordStop"),
+  macroRecordAddText: (text) =>
+    ipcRenderer.invoke("macro:recordAddText", { text }),
+  macroRecordAddKey: (key) => ipcRenderer.invoke("macro:recordAddKey", { key }),
+  macroRecordAddWait: (durationMs) =>
+    ipcRenderer.invoke("macro:recordAddWait", { durationMs }),
+  macroSave: (name, description, steps) =>
+    ipcRenderer.invoke("macro:save", { name, description, steps }),
+  macroLoad: (id) => ipcRenderer.invoke("macro:load", { id }),
+  macroPlay: (deviceId, macroId, options) =>
+    ipcRenderer.invoke("macro:play", { deviceId, macroId, options }),
+  macroStop: (deviceId) => ipcRenderer.invoke("macro:stop", { deviceId }),
+
+  // ✅ realtime macro state/progress
+  onMacroState: (cb) => {
+    ipcRenderer.on("macro:state", (_, payload) => cb(payload));
+  },
+  onMacroProgress: (cb) => {
+    ipcRenderer.on("macro:progress", (_, payload) => cb(payload));
+  },
 });

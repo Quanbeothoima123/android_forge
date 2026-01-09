@@ -2,10 +2,19 @@
 const { app, BrowserWindow, ipcMain } = require("electron");
 const path = require("path");
 const fs = require("fs");
+const { randomUUID } = require("crypto");
 
 const { DeviceRegistry } = require("./controller/deviceRegistry");
 const { scrcpy } = require("./controller/scrcpyController");
 const input = require("./controller/inputControllerAdb");
+
+// ✅ Core 3
+const { MacroRecorder } = require("./macro/macroRecorder");
+const { listMacros, loadMacro, saveMacro } = require("./macro/macroStore");
+const { runMacroOnDevice } = require("./macro/macroRunner");
+
+// ✅ V2 Hook
+const { ScrcpyHook } = require("./macro/scrcpyHook");
 
 if (require("electron-squirrel-startup")) {
   app.quit();
@@ -13,6 +22,23 @@ if (require("electron-squirrel-startup")) {
 
 const registry = new DeviceRegistry();
 let mainWindow = null;
+
+// ✅ Macro state
+const recorder = new MacroRecorder();
+const hook = new ScrcpyHook();
+
+// running: deviceId -> { stop:boolean, token:number, startedAt:number, macroId:string }
+const runningMacroByDevice = new Map();
+
+function sendMacroState(deviceId, state) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send("macro:state", { deviceId, ...state });
+}
+
+function sendMacroProgress(deviceId, payload) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send("macro:progress", { deviceId, ...payload });
+}
 
 // ===== settings persistence =====
 function settingsPath() {
@@ -51,7 +77,7 @@ function clampInt(n, min, max) {
 function normalizeScalePct(pct) {
   const p = Number(pct);
   if (!Number.isFinite(p)) return 50;
-  const allowed = [25, 50, 75, 100]; // ✅ remove 125
+  const allowed = [25, 50, 75, 100];
   let best = allowed[0];
   let bestDist = Math.abs(p - best);
   for (const a of allowed) {
@@ -68,7 +94,6 @@ function normalizeScalePct(pct) {
 let deviceOrder = []; // array of deviceId (persisted)
 function setDeviceOrder(newOrder) {
   if (!Array.isArray(newOrder)) return;
-  // keep only unique strings
   const seen = new Set();
   const cleaned = [];
   for (const id of newOrder) {
@@ -94,9 +119,9 @@ function sortDevicesByOrder(devices) {
 
 // ===== layout config (persisted) =====
 const layoutConfig = {
-  scalePct: 50, // 25/50/75/100
+  scalePct: 50,
   cols: 4,
-  rows: 0, // 0 => no clamp
+  rows: 0,
   margin: 8,
   forceResizeOnApply: true,
 };
@@ -141,11 +166,10 @@ function setLayoutConfig(patch = {}) {
     setDeviceOrder(patch.deviceOrder);
   }
 
-  // persist immediately (best-effort)
   writeSettingsFile({ v: 1, ...getLayoutConfig() });
 }
 
-// ===== slot manager (still used for stable per-device port, but slotIndex now follows UI order) =====
+// ===== slot manager =====
 const slotByDevice = new Map(); // deviceId -> slotIndex
 let nextSlot = 0;
 
@@ -169,7 +193,7 @@ function portForSlot(slotIndex) {
 function createWindow() {
   const win = new BrowserWindow({
     width: 1180,
-    height: 820,
+    height: 900,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -188,10 +212,6 @@ function ensureOnline(ctx) {
   return ctx;
 }
 
-/**
- * Compute initial window size & scrcpy maxSize from scale + device aspect.
- * - baseW100 is farm base width at 100%.
- */
 function computeScrcpyCellAndMaxSize(deviceSnapshot, scalePct) {
   const res = deviceSnapshot?.resolution;
   const scale = normalizeScalePct(scalePct) / 100;
@@ -234,8 +254,26 @@ function rawToPx(raw, axisMax) {
   return clampInt(val, 0, axisMax - 1);
 }
 
+function rawToPct(raw, axisMax) {
+  if (!raw || !Number.isFinite(axisMax) || axisMax <= 0)
+    throw new Error("Missing resolution to convert coordinates");
+
+  const unit = String(raw.unit || "px");
+  const val = Number(raw.value);
+
+  if (!Number.isFinite(val)) throw new Error("Invalid coordinate");
+
+  if (unit === "pct") {
+    let p = val;
+    if (p > 1) p = p / 100;
+    return Math.max(0, Math.min(1, p));
+  }
+
+  // px -> pct
+  return Math.max(0, Math.min(1, val / axisMax));
+}
+
 app.whenReady().then(() => {
-  // load settings once userData is available
   const saved = readSettingsFile();
   if (saved && typeof saved === "object") {
     setDeviceOrder(saved.deviceOrder || []);
@@ -272,7 +310,6 @@ app.whenReady().then(() => {
     return getLayoutConfig();
   });
 
-  // helper: ensure device appears in deviceOrder (for new devices)
   function ensureInOrder(deviceId) {
     if (!deviceOrder.includes(deviceId)) {
       deviceOrder.push(deviceId);
@@ -288,9 +325,7 @@ app.whenReady().then(() => {
 
     ensureInOrder(deviceId);
 
-    // slotIndex follows UI order (not alloc order)
     const slotIndex = Math.max(0, deviceOrder.indexOf(deviceId));
-    // keep stable port mapping per slotIndex
     allocSlot(deviceId);
     const port = portForSlot(slotIndex);
 
@@ -334,12 +369,10 @@ app.whenReady().then(() => {
     return scrcpy.isRunning(deviceId);
   });
 
-  // StartAll uses UI order first
   ipcMain.handle("scrcpy:startAll", async () => {
     const cfg = getLayoutConfig();
     const online = registry.listSnapshots().filter((d) => d.state === "ONLINE");
 
-    // ensure all online devices are in order list
     for (const d of online) ensureInOrder(d.deviceId);
 
     const orderedOnline = sortDevicesByOrder(online);
@@ -382,9 +415,7 @@ app.whenReady().then(() => {
         });
 
         started.push(d.deviceId);
-      } catch {
-        // ignore per-device start errors
-      }
+      } catch {}
 
       await sleep(180);
     }
@@ -399,7 +430,6 @@ app.whenReady().then(() => {
     return true;
   });
 
-  // Apply layout to running windows (order = deviceOrder)
   ipcMain.handle("scrcpy:applyLayout", async (_, payload = {}) => {
     const cfg = getLayoutConfig();
     const forceResize =
@@ -414,7 +444,7 @@ app.whenReady().then(() => {
 
     const ordered = sortDevicesByOrder(runningOnline);
 
-    const items = ordered.map((d, idx) => {
+    const items = ordered.map((d) => {
       const s = scrcpy.procs.get(d.deviceId);
       return {
         deviceId: d.deviceId,
@@ -423,7 +453,6 @@ app.whenReady().then(() => {
       };
     });
 
-    // use first running device to compute cell size
     let cell = { width: 360, height: 780, maxSize: 540 };
     if (ordered.length) {
       const ctx = registry.get(ordered[0].deviceId);
@@ -482,6 +511,13 @@ app.whenReady().then(() => {
       const px = rawToPx(x, res.width);
       const py = rawToPx(y, res.height);
 
+      // ✅ If recording, store pct
+      if (recorder.isRecording()) {
+        const xp = rawToPct(x, res.width);
+        const yp = rawToPct(y, res.height);
+        recorder.recordTapPct(xp, yp);
+      }
+
       return input.tap(deviceId, px, py);
     });
   });
@@ -500,6 +536,16 @@ app.whenReady().then(() => {
       const y2 = rawToPx(payload.y2, res.height);
 
       const dur = Number(payload.durationMs) || 220;
+
+      // ✅ If recording, store pct
+      if (recorder.isRecording()) {
+        const x1p = rawToPct(payload.x1, res.width);
+        const y1p = rawToPct(payload.y1, res.height);
+        const x2p = rawToPct(payload.x2, res.width);
+        const y2p = rawToPct(payload.y2, res.height);
+        recorder.recordSwipePct(x1p, y1p, x2p, y2p, dur);
+      }
+
       return input.swipe(payload.deviceId, x1, y1, x2, y2, dur);
     });
   });
@@ -533,8 +579,159 @@ app.whenReady().then(() => {
     });
   });
 
+  // ===== Core 3: Macro IPC =====
+  ipcMain.handle("macro:list", async () => {
+    return listMacros(app.getPath("userData"));
+  });
+
+  // ✅ Record start (V2: hook global mouse on scrcpy window)
+  ipcMain.handle("macro:recordStart", async (_, { deviceId }) => {
+    const ctx = ensureOnline(registry.get(deviceId));
+    const snap = ctx.snapshot();
+    const res = snap.resolution;
+    if (!res?.width || !res?.height)
+      throw new Error("Device resolution not ready yet");
+
+    const running = scrcpy.isRunning(deviceId);
+    if (!running) {
+      throw new Error(
+        "scrcpy is not running for this device. Start scrcpy first."
+      );
+    }
+
+    // start macro recorder
+    recorder.start({ deviceId, deviceRes: res });
+
+    // start hook: mouse => recorder steps (TAP/SWIPE/LONG_PRESS)
+    hook.start({
+      deviceId,
+      deviceRes: res,
+      onStep: (s) => {
+        // recorder expects "pct steps"
+        if (s.type === "TAP") recorder.recordTapPct(s.xPct, s.yPct);
+        if (s.type === "LONG_PRESS")
+          recorder.recordLongPressPct(s.xPct, s.yPct, s.durationMs);
+        if (s.type === "SWIPE")
+          recorder.recordSwipePct(
+            s.x1Pct,
+            s.y1Pct,
+            s.x2Pct,
+            s.y2Pct,
+            s.durationMs
+          );
+      },
+    });
+
+    return { ok: true };
+  });
+
+  ipcMain.handle("macro:recordStop", async () => {
+    try {
+      hook.stop();
+    } catch {}
+
+    const { steps } = recorder.stop();
+    return { ok: true, steps };
+  });
+
+  ipcMain.handle("macro:recordAddText", async (_, { text }) => {
+    recorder.injectText(text);
+    return { ok: true };
+  });
+
+  ipcMain.handle("macro:recordAddKey", async (_, { key }) => {
+    recorder.injectKey(key);
+    return { ok: true };
+  });
+
+  ipcMain.handle("macro:recordAddWait", async (_, { durationMs }) => {
+    recorder.injectWait(durationMs);
+    return { ok: true };
+  });
+
+  ipcMain.handle("macro:save", async (_, { name, description, steps }) => {
+    const id =
+      String(name || "")
+        .trim()
+        .replace(/\s+/g, "_")
+        .toLowerCase() || randomUUID();
+
+    const macro = {
+      meta: {
+        id,
+        name: name || id,
+        description: description || "",
+        version: 2,
+        createdAt: Date.now(),
+      },
+      settings: {
+        randomize: { xyJitterPct: 0.003, delayJitterPct: 0.12 },
+        playbackSpeed: 1.0,
+      },
+      steps: Array.isArray(steps) ? steps : [],
+    };
+
+    return saveMacro(app.getPath("userData"), macro);
+  });
+
+  ipcMain.handle("macro:load", async (_, { id }) => {
+    return loadMacro(app.getPath("userData"), id);
+  });
+
+  // ✅ Play: anti-spam + progress + hard stop
+  ipcMain.handle("macro:play", async (_, { deviceId, macroId, options }) => {
+    const ctx = ensureOnline(registry.get(deviceId));
+    const macro = loadMacro(app.getPath("userData"), macroId);
+
+    // ✅ reject if already running
+    if (runningMacroByDevice.has(deviceId)) {
+      throw new Error("Macro already running on this device. Stop it first.");
+    }
+
+    const state = {
+      stop: false,
+      token: Date.now(), // run token
+      startedAt: Date.now(),
+      macroId,
+    };
+    runningMacroByDevice.set(deviceId, state);
+
+    sendMacroState(deviceId, { running: true, macroId });
+
+    return ctx.enqueue(async () => {
+      try {
+        const loop = Number(options?.loop ?? 1);
+        const loops = Number.isFinite(loop) ? Math.max(1, Math.floor(loop)) : 1;
+
+        for (let li = 0; li < loops; li++) {
+          if (state.stop) break;
+
+          await runMacroOnDevice(ctx, macro, options || {}, {
+            shouldStop: () => state.stop,
+            token: state.token,
+            onProgress: (p) => sendMacroProgress(deviceId, p),
+          });
+        }
+
+        return { ok: true };
+      } finally {
+        runningMacroByDevice.delete(deviceId);
+        sendMacroState(deviceId, { running: false, macroId: "" });
+      }
+    });
+  });
+
+  ipcMain.handle("macro:stop", async (_, { deviceId }) => {
+    const s = runningMacroByDevice.get(deviceId);
+    if (s) {
+      s.stop = true;
+      // đổi token để mọi retry/loop exit
+      s.token = Date.now();
+    }
+    return { ok: true };
+  });
+
   app.on("before-quit", () => {
-    // best-effort save
     writeSettingsFile({ v: 1, ...getLayoutConfig() });
   });
 

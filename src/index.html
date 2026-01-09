@@ -135,6 +135,10 @@
             width: 120px;
         }
 
+        input.w220 {
+            width: 220px;
+        }
+
         .hr {
             height: 1px;
             background: #eee;
@@ -163,7 +167,7 @@
         </label>
 
         <span class="muted small">
-            scrcpy mở trực tiếp (manual control). Electron chỉ điều khiển nhanh + sắp xếp cửa sổ.
+            scrcpy mở trực tiếp. Electron điều khiển + sắp xếp cửa sổ + macro.
         </span>
     </div>
 
@@ -249,6 +253,61 @@
                 <input id="swY2" class="w90" placeholder="y2" />
                 <input id="swDur" class="w90" placeholder="dur(ms)" value="220" />
                 <button id="swipeBtn">Swipe</button>
+            </div>
+
+            <!-- ✅ Macro UI -->
+            <div class="hr"></div>
+
+            <div class="sectionTitle">Macro</div>
+
+            <div class="inline small">
+                <button id="macroRecStartBtn">Start Record</button>
+                <button id="macroRecStopBtn">Stop Record</button>
+
+                <span class="pill">V2: record bằng click/drag trực tiếp trên cửa sổ scrcpy
+                    (forge:&lt;deviceId&gt;)</span>
+            </div>
+
+            <!-- ✅ macro runtime status -->
+            <div id="macroStatus" class="muted small" style="margin-top:6px;">Macro: IDLE</div>
+
+            <div class="inline small" style="margin-top:8px;">
+                <input id="macroText" class="w220" placeholder="Text (Unicode)..." />
+                <button id="macroAddTextBtn">Add TEXT</button>
+
+                <select id="macroKeySel">
+                    <option value="BACK">BACK</option>
+                    <option value="HOME">HOME</option>
+                    <option value="ENTER">ENTER</option>
+                </select>
+                <button id="macroAddKeyBtn">Add KEY</button>
+
+                <input id="macroWaitMs" class="w90" placeholder="WAIT ms" value="500" />
+                <button id="macroAddWaitBtn">Add WAIT</button>
+            </div>
+
+            <div class="inline small" style="margin-top:8px;">
+                <input id="macroName" class="w120" placeholder="Macro name" />
+                <input id="macroDesc" class="w220" placeholder="Desc" />
+                <button id="macroSaveBtn">Save Macro</button>
+            </div>
+
+            <div class="inline small" style="margin-top:8px;">
+                <select id="macroList" class="w220"></select>
+                <button id="macroReloadBtn">Reload</button>
+
+                <input id="macroLoop" class="w90" placeholder="loop" value="1" />
+                <button id="macroPlayBtn">Play on selected</button>
+                <button id="macroStopBtn">Stop</button>
+            </div>
+
+            <div class="inline small" style="margin-top:8px;">
+                <span class="muted">Random:</span>
+                <input id="macroJitterXY" class="w90" value="0.003" />
+                <span class="muted">DelayJitter:</span>
+                <input id="macroJitterDelay" class="w90" value="0.12" />
+                <span class="muted">Speed:</span>
+                <input id="macroSpeed" class="w90" value="1.0" />
             </div>
 
             <div class="sectionTitle">Log</div>

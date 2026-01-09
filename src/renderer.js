@@ -36,6 +36,43 @@ let layoutState = {
 // Drag reorder local working list (device ids in UI order)
 let uiOrder = [];
 
+// ===== Macro state =====
+let recordedSteps = [];
+const macroRuntimeByDevice = new Map(); // deviceId -> { running, macroId, stepIndex, stepCount, stepType }
+
+function setMacroUiEnabled(enabled) {
+  // disable play / record while running
+  $("macroPlayBtn").disabled = !enabled;
+  $("macroRecStartBtn").disabled = !enabled;
+  $("macroSaveBtn").disabled = !enabled;
+  // Stop luôn enabled
+  $("macroStopBtn").disabled = false;
+}
+
+function renderMacroStatus(deviceId) {
+  const st = macroRuntimeByDevice.get(deviceId);
+  const el = $("macroStatus");
+  if (!el) return;
+
+  if (!deviceId) {
+    el.textContent = "Macro: (no device)";
+    setMacroUiEnabled(true);
+    return;
+  }
+
+  if (!st || !st.running) {
+    el.textContent = "Macro: IDLE";
+    setMacroUiEnabled(true);
+    return;
+  }
+
+  const idx = st.stepIndex ?? 0;
+  const cnt = st.stepCount ?? "?";
+  const type = st.stepType || "";
+  el.textContent = `Macro: RUNNING • step ${idx}/${cnt} ${type ? `• ${type}` : ""}`;
+  setMacroUiEnabled(false);
+}
+
 async function pullLayoutFromMain() {
   try {
     const cfg = await window.forgeAPI.getLayout();
@@ -77,7 +114,6 @@ function ensureInUiOrder(devices) {
   for (const d of devices) {
     if (!existing.has(d.deviceId)) uiOrder.push(d.deviceId);
   }
-  // also remove ids that are gone (optional)
   const alive = new Set(devices.map((d) => d.deviceId));
   uiOrder = uiOrder.filter((id) => alive.has(id));
 }
@@ -138,6 +174,7 @@ function renderDevices(devices) {
     div.addEventListener("click", () => {
       selectedDeviceId = d.deviceId;
       refreshUI();
+      renderMacroStatus(selectedDeviceId);
     });
 
     // drag & drop reorder
@@ -153,7 +190,6 @@ function renderDevices(devices) {
     div.addEventListener("dragend", () => {
       div.classList.remove("dragging");
       dragSrcId = "";
-      // clear hints
       for (const el of wrap.querySelectorAll(".deviceItem.dropHint")) {
         el.classList.remove("dropHint");
       }
@@ -205,6 +241,7 @@ async function updateSelectedInfo() {
   if (!selectedDeviceId) {
     $("selectedInfo").textContent = "(chọn thiết bị bên trái)";
     $("runningBadge").textContent = "RUNNING: ?";
+    renderMacroStatus("");
     return;
   }
 
@@ -214,7 +251,7 @@ async function updateSelectedInfo() {
   $("selectedInfo").innerHTML = `
     <div><b>${d.model || selectedDeviceId}</b></div>
     <div class="muted mono">${selectedDeviceId}</div>
-    <div class="muted">State: ${d.state} • Android ${d.androidVersion || "?"} • Res: ${fmtRes(d)}</div>
+    <div class="muted">State: ${d.state} • Android ${d.androidVersion || "?"} • Res: ${fmtRes(d)} • AgentReady: ${d.agentReady ? "YES" : "NO"}</div>
   `;
 
   try {
@@ -223,6 +260,8 @@ async function updateSelectedInfo() {
     badge.textContent = `RUNNING: ${running ? "YES" : "NO"}`;
     badge.className = "badge " + (running ? "ok" : "bad");
   } catch {}
+
+  renderMacroStatus(selectedDeviceId);
 }
 
 // ===== Hybrid parse =====
@@ -398,6 +437,158 @@ $("swipeBtn").addEventListener("click", () =>
   })
 );
 
+// ===== Macro UI =====
+async function reloadMacroList() {
+  const list = await window.forgeAPI.listMacros();
+  const sel = $("macroList");
+  sel.innerHTML = "";
+  for (const m of list) {
+    const opt = document.createElement("option");
+    opt.value = m.id;
+    const name = m.meta?.name || m.id;
+    opt.textContent = `${name} (${m.id})`;
+    sel.appendChild(opt);
+  }
+}
+
+$("macroReloadBtn").addEventListener("click", () =>
+  act("macro reload", reloadMacroList)
+);
+
+$("macroRecStartBtn").addEventListener("click", () =>
+  act("macro record start", async () => {
+    const id = mustSelected();
+
+    // nếu đang running macro -> chặn
+    const st = macroRuntimeByDevice.get(id);
+    if (st?.running) throw new Error("Macro is running. Stop first.");
+
+    await window.forgeAPI.macroRecordStart(id);
+    recordedSteps = [];
+    log("Recording started (V2: click/drag trực tiếp trên scrcpy window)");
+  })
+);
+
+$("macroRecStopBtn").addEventListener("click", () =>
+  act("macro record stop", async () => {
+    const r = await window.forgeAPI.macroRecordStop();
+    recordedSteps = r.steps || [];
+    log(`Recording stopped. steps=${recordedSteps.length}`);
+  })
+);
+
+$("macroAddTextBtn").addEventListener("click", () =>
+  act("macro add text", async () => {
+    const text = $("macroText").value || "";
+    await window.forgeAPI.macroRecordAddText(text);
+    log(`TEXT step added: "${text}"`);
+  })
+);
+
+$("macroAddKeyBtn").addEventListener("click", () =>
+  act("macro add key", async () => {
+    const key = $("macroKeySel").value;
+    await window.forgeAPI.macroRecordAddKey(key);
+    log(`KEY step added: ${key}`);
+  })
+);
+
+$("macroAddWaitBtn").addEventListener("click", () =>
+  act("macro add wait", async () => {
+    const ms = Number($("macroWaitMs").value || 0);
+    await window.forgeAPI.macroRecordAddWait(ms);
+    log(`WAIT step added: ${ms}ms`);
+  })
+);
+
+$("macroSaveBtn").addEventListener("click", () =>
+  act("macro save", async () => {
+    const name = $("macroName").value || "macro_" + Date.now();
+    const desc = $("macroDesc").value || "";
+    if (!recordedSteps.length)
+      throw new Error("No recorded steps. Stop Record first.");
+    await window.forgeAPI.macroSave(name, desc, recordedSteps);
+    log(`Saved macro: ${name}`);
+    await reloadMacroList();
+  })
+);
+
+$("macroPlayBtn").addEventListener("click", () =>
+  act("macro play", async () => {
+    const id = mustSelected();
+
+    const st = macroRuntimeByDevice.get(id);
+    if (st?.running)
+      throw new Error("Macro is already running on this device.");
+
+    const macroId = $("macroList").value;
+    if (!macroId) throw new Error("Select a macro");
+
+    const loop = Number($("macroLoop").value || 1);
+    const speed = Number($("macroSpeed").value || 1.0);
+    const xyJitterPct = Number($("macroJitterXY").value || 0.0);
+    const delayJitterPct = Number($("macroJitterDelay").value || 0.0);
+
+    // optimistic lock UI
+    macroRuntimeByDevice.set(id, {
+      running: true,
+      macroId,
+      stepIndex: 0,
+      stepCount: "?",
+    });
+    renderMacroStatus(id);
+
+    await window.forgeAPI.macroPlay(id, macroId, {
+      loop,
+      speed,
+      xyJitterPct,
+      delayJitterPct,
+    });
+
+    log(`Play macro ${macroId} on ${id}`);
+  })
+);
+
+$("macroStopBtn").addEventListener("click", () =>
+  act("macro stop", async () => {
+    const id = mustSelected();
+    await window.forgeAPI.macroStop(id);
+    log("Stop requested");
+  })
+);
+
+// ✅ listen macro state/progress from main
+window.forgeAPI.onMacroState((p) => {
+  const { deviceId, running, macroId } = p || {};
+  if (!deviceId) return;
+  const cur = macroRuntimeByDevice.get(deviceId) || {};
+  macroRuntimeByDevice.set(deviceId, {
+    ...cur,
+    running: !!running,
+    macroId: macroId || cur.macroId || "",
+    stepIndex: running ? (cur.stepIndex ?? 0) : 0,
+    stepCount: running ? (cur.stepCount ?? "?") : 0,
+    stepType: running ? (cur.stepType ?? "") : "",
+  });
+
+  if (deviceId === selectedDeviceId) renderMacroStatus(deviceId);
+});
+
+window.forgeAPI.onMacroProgress((p) => {
+  const { deviceId, stepIndex, stepCount, stepType } = p || {};
+  if (!deviceId) return;
+  const cur = macroRuntimeByDevice.get(deviceId) || {};
+  macroRuntimeByDevice.set(deviceId, {
+    ...cur,
+    running: true,
+    stepIndex,
+    stepCount,
+    stepType,
+  });
+
+  if (deviceId === selectedDeviceId) renderMacroStatus(deviceId);
+});
+
 // ===== refresh loop =====
 async function refreshUI() {
   const devices = await window.forgeAPI.listDevices();
@@ -428,7 +619,6 @@ async function refreshUI() {
           await window.forgeAPI.scrcpyStart(d.deviceId);
         }
       } catch {
-        // ignore
       } finally {
         setTimeout(() => autoStartPending.delete(d.deviceId), 1200);
       }
@@ -448,10 +638,9 @@ window.forgeAPI.onScrcpyClosed(({ deviceId, code, signal }) => {
 });
 
 (async function boot() {
-  log(
-    "Control Panel loaded. scrcpy windows are direct (no Electron streaming)."
-  );
+  log("Control Panel loaded. Core 3 macro enabled (V2 hook).");
   await pullLayoutFromMain();
   await refreshUI();
+  await reloadMacroList();
   setInterval(refreshUI, 1500);
 })();

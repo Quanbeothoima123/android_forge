@@ -1,6 +1,8 @@
 // src/macro/scrcpyHook.js
 const { windowManager } = require("node-window-manager");
-const uiohook = require("uiohook-napi");
+
+// ✅ FIX: uiohook-napi export { uIOhook }
+const { uIOhook } = require("uiohook-napi");
 
 function findScrcpyWindow(deviceId) {
   const target = `forge:${deviceId}`;
@@ -70,11 +72,12 @@ class ScrcpyHook {
     }
     this._win = win;
 
-    uiohook.on("mousedown", this._handleDown);
-    uiohook.on("mouseup", this._handleUp);
-    uiohook.on("mousemove", this._handleMove);
+    // ✅ FIX: dùng uIOhook thay vì uiohook
+    uIOhook.on("mousedown", this._handleDown);
+    uIOhook.on("mouseup", this._handleUp);
+    uIOhook.on("mousemove", this._handleMove);
 
-    uiohook.start();
+    uIOhook.start();
     this._running = true;
     return { ok: true };
   }
@@ -83,10 +86,18 @@ class ScrcpyHook {
     if (!this._running) return { ok: true };
 
     try {
-      uiohook.off("mousedown", this._handleDown);
-      uiohook.off("mouseup", this._handleUp);
-      uiohook.off("mousemove", this._handleMove);
-      uiohook.stop();
+      // Một số bản uiohook có off, một số dùng removeListener
+      if (typeof uIOhook.off === "function") {
+        uIOhook.off("mousedown", this._handleDown);
+        uIOhook.off("mouseup", this._handleUp);
+        uIOhook.off("mousemove", this._handleMove);
+      } else if (typeof uIOhook.removeListener === "function") {
+        uIOhook.removeListener("mousedown", this._handleDown);
+        uIOhook.removeListener("mouseup", this._handleUp);
+        uIOhook.removeListener("mousemove", this._handleMove);
+      }
+
+      if (typeof uIOhook.stop === "function") uIOhook.stop();
     } catch {}
 
     this._running = false;

@@ -1,5 +1,5 @@
 // src/macro/macroRunner.js
-const input = require("../controller/inputControllerAdb");
+const input = require("../controller/inputControllerSmart");
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -44,7 +44,10 @@ async function runMacroOnDevice(ctx, macro, options = {}, runtime = {}) {
   if (!steps.length) return;
 
   let lastTapPct = null;
+
+  // ✅ ensure ctx.deviceId exists (inputControllerSmart expects ctx.deviceId)
   const deviceId = getDeviceId(ctx);
+  if (!ctx.deviceId) ctx.deviceId = deviceId;
 
   for (let i = 0; i < steps.length; i++) {
     if (shouldStop()) break;
@@ -54,6 +57,7 @@ async function runMacroOnDevice(ctx, macro, options = {}, runtime = {}) {
 
     onProgress({ stepIndex: i + 1, stepCount: steps.length, stepType: type });
 
+    // delay between steps (dtMs)
     const dt = Number(s.dtMs ?? 60);
     const baseDelay = Math.max(0, Math.round(dt / speed));
     const jitter = baseDelay * delayJitterPct * (Math.random() * 2 - 1);
@@ -71,7 +75,7 @@ async function runMacroOnDevice(ctx, macro, options = {}, runtime = {}) {
       const x = pctToPx(xPct, w);
       const y = pctToPx(yPct, h);
       lastTapPct = { xPct, yPct };
-      await input.tap(deviceId, x, y);
+      await input.tap(ctx, x, y);
       continue;
     }
 
@@ -82,7 +86,7 @@ async function runMacroOnDevice(ctx, macro, options = {}, runtime = {}) {
       const y = pctToPx(yPct, h);
       lastTapPct = { xPct, yPct };
       const dur = Math.max(80, Number(s.durationMs || 600));
-      await input.longPress(deviceId, x, y, dur);
+      await input.longPress(ctx, x, y, dur);
       continue;
     }
 
@@ -91,21 +95,20 @@ async function runMacroOnDevice(ctx, macro, options = {}, runtime = {}) {
       const y1Pct = jitterPct(Number(s.y1Pct), xyJitterPct);
       const x2Pct = jitterPct(Number(s.x2Pct), xyJitterPct);
       const y2Pct = jitterPct(Number(s.y2Pct), xyJitterPct);
+
       const x1 = pctToPx(x1Pct, w);
       const y1 = pctToPx(y1Pct, h);
       const x2 = pctToPx(x2Pct, w);
       const y2 = pctToPx(y2Pct, h);
+
       const dur = Math.max(80, Number(s.durationMs || 220));
-      await input.swipe(deviceId, x1, y1, x2, y2, dur);
+      await input.swipe(ctx, x1, y1, x2, y2, dur);
       continue;
     }
 
     if (type === "KEY") {
       const key = String(s.key || "").toUpperCase();
-      if (key === "HOME") await input.home(deviceId);
-      else if (key === "BACK") await input.back(deviceId);
-      else if (key === "RECENTS") await input.recents(deviceId);
-      else if (key === "ENTER") await input.key(deviceId, "ENTER");
+      await input.key(ctx, key);
       continue;
     }
 
@@ -117,20 +120,33 @@ async function runMacroOnDevice(ctx, macro, options = {}, runtime = {}) {
 
     if (type === "TEXT") {
       const text = String(s.text || "");
-      let r = await input.text(deviceId, text);
 
-      if (typeof r === "string" && r.startsWith("ERR") && lastTapPct) {
-        if (r.includes("no_focus") || r.includes("not_editable")) {
-          const x = pctToPx(lastTapPct.xPct, w);
-          const y = pctToPx(lastTapPct.yPct, h);
-          await input.tap(deviceId, x, y);
-          await sleep(120);
-          r = await input.text(deviceId, text);
+      // TEXT trong smart controller yêu cầu agentReady = true
+      // (đúng mục tiêu của bạn cho Unicode)
+      try {
+        let r = await input.text(ctx, text);
+
+        // fallback: nếu agent trả ERR no_focus / not_editable và có lastTapPct
+        if (typeof r === "string" && r.startsWith("ERR") && lastTapPct) {
+          if (r.includes("no_focus") || r.includes("not_editable")) {
+            const x = pctToPx(lastTapPct.xPct, w);
+            const y = pctToPx(lastTapPct.yPct, h);
+            await input.tap(ctx, x, y);
+            await sleep(120);
+            r = await input.text(ctx, text);
+          }
         }
-      }
 
-      if (typeof r === "string" && r.startsWith("ERR")) {
-        throw new Error(r);
+        if (typeof r === "string" && r.startsWith("ERR")) {
+          throw new Error(r);
+        }
+      } catch (e) {
+        // normalize error message (giữ đúng error bạn đang expect)
+        const msg = String(e?.message || e || "");
+        if (msg.toLowerCase().includes("agent not ready")) {
+          throw new Error("ERR unicode_not_supported_without_agent");
+        }
+        throw e;
       }
       continue;
     }

@@ -25,19 +25,6 @@ function pctToPx(pct01, axisMax) {
   return Math.max(0, Math.min(axisMax - 1, Math.round(pct01 * axisMax)));
 }
 
-/**
- * GroupBroadcast
- * - Broadcast actions to many devices, staggered by per-device delay + jitter
- * - Per-device random offset (xy jitter)
- * - Group Macro run with stop per device
- *
- * Requires:
- * - registry: DeviceRegistry
- * - getGroup: (groupId)=>{id,name,devices:Set|Array}
- * - loadMacroById: (macroId)=>macroObj
- * - runningMacroByDevice: Map for locking (shared with single-device macro)
- * - sendMacroState/progress: same channel as existing renderer (macro:state, macro:progress)
- */
 class GroupBroadcast {
   constructor({
     registry,
@@ -56,7 +43,6 @@ class GroupBroadcast {
     this.sendMacroState = sendMacroState || (() => {});
     this.sendMacroProgress = sendMacroProgress || (() => {});
 
-    // groupId -> { runId, states: Map(deviceId -> {stop:boolean, startedAt:number, macroId:string}) }
     this.runningByGroup = new Map();
   }
 
@@ -67,9 +53,6 @@ class GroupBroadcast {
     return arr.map((x) => String(x)).filter(Boolean);
   }
 
-  /**
-   * Fanout helper: schedule per device with baseDelay*i + jitter
-   */
   async _fanout(groupId, fn, opts = {}) {
     const deviceIds = this._devicesOfGroup(groupId);
 
@@ -97,10 +80,6 @@ class GroupBroadcast {
     return true;
   }
 
-  /**
-   * Broadcast TAP by pct (0..1)
-   * opts: { baseDelayMs, jitterMs, xyJitterPct }
-   */
   tapPct(groupId, xPct, yPct, opts = {}) {
     const xyJitterPct = Number(opts.xyJitterPct || 0);
 
@@ -123,9 +102,6 @@ class GroupBroadcast {
     );
   }
 
-  /**
-   * Broadcast SWIPE by pct
-   */
   swipePct(groupId, x1Pct, y1Pct, x2Pct, y2Pct, durationMs = 220, opts = {}) {
     const xyJitterPct = Number(opts.xyJitterPct || 0);
     const dur = Math.max(80, Number(durationMs) || 220);
@@ -153,11 +129,40 @@ class GroupBroadcast {
     );
   }
 
-  /**
-   * Broadcast KEY
-   * - HOME/BACK => smart (agent if ready)
-   * - Others => ADB key fallback (stable)
-   */
+  swipeDir(groupId, dir, opts = {}) {
+    const d = String(dir || "").toLowerCase();
+    const dur = Math.max(80, Number(opts.durationMs || 220));
+
+    return this._fanout(
+      groupId,
+      async (ctx) => {
+        const snap = ctx.snapshot();
+        const r = snap.resolution;
+        if (!r?.width || !r?.height) return;
+
+        const w = r.width;
+        const h = r.height;
+
+        const xMid = Math.round(w * 0.5);
+        const yMid = Math.round(h * 0.5);
+
+        const xL = Math.round(w * 0.2);
+        const xR = Math.round(w * 0.8);
+        const yT = Math.round(h * 0.25);
+        const yB = Math.round(h * 0.75);
+
+        if (d === "up") return inputSmart.swipe(ctx, xMid, yB, xMid, yT, dur);
+        if (d === "down") return inputSmart.swipe(ctx, xMid, yT, xMid, yB, dur);
+        if (d === "left") return inputSmart.swipe(ctx, xR, yMid, xL, yMid, dur);
+        if (d === "right")
+          return inputSmart.swipe(ctx, xL, yMid, xR, yMid, dur);
+
+        throw new Error("Unknown dir");
+      },
+      opts
+    );
+  }
+
   key(groupId, keyName, opts = {}) {
     const k = String(keyName || "").toUpperCase();
 
@@ -168,27 +173,47 @@ class GroupBroadcast {
           await inputSmart.key(ctx, k);
           return;
         }
-        // use adbInput.key which supports more keys
         await adbInput.key(ctx.deviceId, k);
       },
       opts
     );
   }
 
-  /**
-   * Run macro on whole group
-   * - Stagger start (baseDelayMs/jitterMs)
-   * - Per device stop
-   * - Locks device if already running macro
-   *
-   * Returns { ok:true, runId, started:[deviceId...] }
-   */
+  wake(groupId, opts = {}) {
+    return this._fanout(
+      groupId,
+      async (ctx) => {
+        await adbInput.wake(ctx.deviceId);
+      },
+      opts
+    );
+  }
+
+  screenOff(groupId, opts = {}) {
+    return this._fanout(
+      groupId,
+      async (ctx) => {
+        await adbInput.screenOff(ctx.deviceId);
+      },
+      opts
+    );
+  }
+
+  shutdown(groupId, opts = {}) {
+    return this._fanout(
+      groupId,
+      async (ctx) => {
+        await adbInput.shutdown(ctx.deviceId);
+      },
+      opts
+    );
+  }
+
   async playMacro(groupId, macroId, options = {}, fanoutOpts = {}) {
     const gDevices = this._devicesOfGroup(groupId);
     const macro = this.loadMacroById(macroId);
     if (!macro) throw new Error("Macro not found: " + macroId);
 
-    // new run
     const runId = Date.now();
     const states = new Map();
     this.runningByGroup.set(groupId, { runId, states });
@@ -207,7 +232,6 @@ class GroupBroadcast {
       const ctx = this.registry.get(deviceId);
       if (!ctx || ctx.state !== "ONLINE") continue;
 
-      // lock: if per-device macro already running, skip
       if (this.runningMacroByDevice.has(deviceId)) continue;
 
       const state = {
@@ -218,7 +242,6 @@ class GroupBroadcast {
       states.set(deviceId, state);
       started.push(deviceId);
 
-      // also lock device globally
       this.runningMacroByDevice.set(deviceId, {
         stop: false,
         token: runId,
@@ -257,12 +280,10 @@ class GroupBroadcast {
 
             return { ok: true };
           } finally {
-            // unlock per device
             const lock = this.runningMacroByDevice.get(deviceId);
             if (lock && lock.token === runId)
               this.runningMacroByDevice.delete(deviceId);
 
-            // clean group state
             const cur = this.runningByGroup.get(groupId);
             if (cur && cur.runId === runId) {
               cur.states.delete(deviceId);
@@ -278,9 +299,6 @@ class GroupBroadcast {
     return { ok: true, runId, started };
   }
 
-  /**
-   * Stop macro for whole group
-   */
   stopGroup(groupId) {
     const cur = this.runningByGroup.get(groupId);
     if (!cur) return { ok: true, stopped: 0 };
@@ -297,13 +315,9 @@ class GroupBroadcast {
       stopped++;
     }
 
-    // keep states, tasks will exit and cleanup
     return { ok: true, stopped };
   }
 
-  /**
-   * Stop macro for a single device in a group run
-   */
   stopDevice(groupId, deviceId) {
     const cur = this.runningByGroup.get(groupId);
     if (!cur) return { ok: true, stopped: false };
@@ -320,9 +334,6 @@ class GroupBroadcast {
     return { ok: true, stopped: !!st };
   }
 
-  /**
-   * Snapshot group macro run (optional)
-   */
   snapshot(groupId) {
     const cur = this.runningByGroup.get(groupId);
     if (!cur) return null;

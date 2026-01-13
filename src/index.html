@@ -178,7 +178,7 @@
                 Tip: Kéo thả để đổi thứ tự (StartAll/Apply layout sẽ theo đúng thứ tự này) — được lưu lại.
             </div>
 
-            <!-- ✅ CORE 4: Groups -->
+            <!-- Groups -->
             <div class="sectionTitle">Groups (Core 4)</div>
             <div class="inline small">
                 <select id="groupSel" class="w220"></select>
@@ -207,10 +207,23 @@
                 <input id="gbXyJitter" class="w90" value="0.004" />
             </div>
 
-            <div class="inline small" style="margin-top:8px;">
+            <!-- ✅ Group Quick -->
+            <div class="sectionTitle">Group Quick (Broadcast)</div>
+            <div class="gridBtns">
+                <button id="gbWakeBtn">Broadcast Wake</button>
+                <button id="gbScreenOffBtn">Broadcast Screen Off</button>
+                <button id="gbShutdownBtn">Broadcast Shutdown</button>
+                <button id="gbRecentsBtn">Broadcast RECENTS</button>
+
                 <button id="gbHomeBtn">Broadcast HOME</button>
                 <button id="gbBackBtn">Broadcast BACK</button>
-                <button id="gbRecentsBtn">Broadcast RECENTS</button>
+                <button id="gbSwipeUpBtn">Broadcast Swipe Up</button>
+                <button id="gbSwipeDownBtn">Broadcast Swipe Down</button>
+
+                <button id="gbSwipeLeftBtn">Broadcast Swipe Left</button>
+                <button id="gbSwipeRightBtn">Broadcast Swipe Right</button>
+                <div></div>
+                <div></div>
             </div>
 
             <div class="hr"></div>
@@ -263,14 +276,19 @@
             <div class="sectionTitle">Quick Controls</div>
             <div class="gridBtns">
                 <button id="wakeBtn">Wake</button>
+                <button id="screenOffBtn">Screen Off</button>
+                <button id="shutdownBtn">Shutdown</button>
                 <button id="homeBtn">Home</button>
+
                 <button id="backBtn">Back</button>
                 <button id="recentsBtn">Recents</button>
-
                 <button id="swipeUpBtn">Swipe Up</button>
                 <button id="swipeDownBtn">Swipe Down</button>
+
                 <button id="swipeLeftBtn">Swipe Left</button>
                 <button id="swipeRightBtn">Swipe Right</button>
+                <div></div>
+                <div></div>
             </div>
 
             <div class="sectionTitle">Tap (Hybrid: % hoặc px)</div>
@@ -337,7 +355,6 @@
                 <button id="macroStopBtn">Stop</button>
             </div>
 
-            <!-- ✅ CORE 4: Group Macro -->
             <div class="sectionTitle">Group Macro (Core 4)</div>
             <div class="inline small">
                 <button id="groupMacroPlayBtn">Play macro on group</button>

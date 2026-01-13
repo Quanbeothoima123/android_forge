@@ -28,6 +28,11 @@ contextBridge.exposeInMainWorld("forgeAPI", {
   recents: (deviceId) => ipcRenderer.invoke("control:recents", { deviceId }),
   wake: (deviceId) => ipcRenderer.invoke("control:wake", { deviceId }),
 
+  // ✅ new: screen off + shutdown
+  screenOff: (deviceId) =>
+    ipcRenderer.invoke("control:screenOff", { deviceId }),
+  shutdown: (deviceId) => ipcRenderer.invoke("control:shutdown", { deviceId }),
+
   tapRaw: (deviceId, x, y) =>
     ipcRenderer.invoke("control:tapRaw", { deviceId, x, y }),
 
@@ -44,7 +49,7 @@ contextBridge.exposeInMainWorld("forgeAPI", {
   swipeDir: (deviceId, dir) =>
     ipcRenderer.invoke("control:swipeDir", { deviceId, dir }),
 
-  // ✅ macros (single device)
+  // macros (single device)
   listMacros: () => ipcRenderer.invoke("macro:list"),
   macroRecordStart: (deviceId) =>
     ipcRenderer.invoke("macro:recordStart", { deviceId }),
@@ -61,7 +66,6 @@ contextBridge.exposeInMainWorld("forgeAPI", {
     ipcRenderer.invoke("macro:play", { deviceId, macroId, options }),
   macroStop: (deviceId) => ipcRenderer.invoke("macro:stop", { deviceId }),
 
-  // ✅ realtime macro state/progress (shared for single & group)
   onMacroState: (cb) => {
     ipcRenderer.on("macro:state", (_, payload) => cb(payload));
   },
@@ -70,7 +74,7 @@ contextBridge.exposeInMainWorld("forgeAPI", {
   },
 
   // ======================
-  // ✅ CORE 4: Groups
+  // Groups
   // ======================
   groupList: () => ipcRenderer.invoke("group:list"),
   groupCreate: (id, name) => ipcRenderer.invoke("group:create", { id, name }),
@@ -95,8 +99,19 @@ contextBridge.exposeInMainWorld("forgeAPI", {
       durationMs,
       opts,
     }),
+  groupSwipeDir: (groupId, dir, opts) =>
+    ipcRenderer.invoke("group:swipeDir", { groupId, dir, opts }),
+
   groupKey: (groupId, key, opts) =>
     ipcRenderer.invoke("group:key", { groupId, key, opts }),
+
+  // ✅ new: group wake/screenOff/shutdown
+  groupWake: (groupId, opts) =>
+    ipcRenderer.invoke("group:wake", { groupId, opts }),
+  groupScreenOff: (groupId, opts) =>
+    ipcRenderer.invoke("group:screenOff", { groupId, opts }),
+  groupShutdown: (groupId, opts) =>
+    ipcRenderer.invoke("group:shutdown", { groupId, opts }),
 
   // Group Macro
   groupMacroPlay: (groupId, macroId, options, fanoutOpts) =>

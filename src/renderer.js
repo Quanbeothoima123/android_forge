@@ -39,9 +39,9 @@ let uiOrder = [];
 
 // ===== Macro state =====
 let recordedSteps = [];
-const macroRuntimeByDevice = new Map(); // deviceId -> { running, macroId, stepIndex, stepCount, stepType }
+const macroRuntimeByDevice = new Map();
 
-// ===== CORE 4: Groups =====
+// ===== Groups =====
 let groups = [];
 let selectedGroupId = "";
 
@@ -321,7 +321,7 @@ async function act(name, fn) {
   }
 }
 
-// ===== CORE 4: Groups UI =====
+// ===== Groups UI =====
 async function reloadGroups() {
   try {
     groups = await window.forgeAPI.groupList();
@@ -398,28 +398,87 @@ $("groupRemoveSelectedBtn").addEventListener("click", () =>
   })
 );
 
-// Broadcast keys
+// ===== Group Broadcast buttons =====
 $("gbHomeBtn").addEventListener("click", () =>
   act("broadcast HOME", async () => {
     const gid = mustGroupSelected();
-    const opts = readFanoutOpts();
-    await window.forgeAPI.groupKey(gid, "HOME", opts);
+    await window.forgeAPI.groupKey(gid, "HOME", readFanoutOpts());
   })
 );
 
 $("gbBackBtn").addEventListener("click", () =>
   act("broadcast BACK", async () => {
     const gid = mustGroupSelected();
-    const opts = readFanoutOpts();
-    await window.forgeAPI.groupKey(gid, "BACK", opts);
+    await window.forgeAPI.groupKey(gid, "BACK", readFanoutOpts());
   })
 );
 
 $("gbRecentsBtn").addEventListener("click", () =>
   act("broadcast RECENTS", async () => {
     const gid = mustGroupSelected();
-    const opts = readFanoutOpts();
-    await window.forgeAPI.groupKey(gid, "RECENTS", opts);
+    await window.forgeAPI.groupKey(gid, "RECENTS", readFanoutOpts());
+  })
+);
+
+$("gbWakeBtn").addEventListener("click", () =>
+  act("broadcast WAKE", async () => {
+    const gid = mustGroupSelected();
+    await window.forgeAPI.groupWake(gid, readFanoutOpts());
+  })
+);
+
+$("gbScreenOffBtn").addEventListener("click", () =>
+  act("broadcast SCREEN OFF", async () => {
+    const gid = mustGroupSelected();
+    await window.forgeAPI.groupScreenOff(gid, readFanoutOpts());
+  })
+);
+
+$("gbShutdownBtn").addEventListener("click", () =>
+  act("broadcast SHUTDOWN", async () => {
+    const gid = mustGroupSelected();
+    // avoid misclick? vẫn chạy thẳng theo yêu cầu bạn
+    await window.forgeAPI.groupShutdown(gid, readFanoutOpts());
+  })
+);
+
+$("gbSwipeUpBtn").addEventListener("click", () =>
+  act("broadcast swipe up", async () => {
+    const gid = mustGroupSelected();
+    await window.forgeAPI.groupSwipeDir(gid, "up", {
+      ...readFanoutOpts(),
+      durationMs: 220,
+    });
+  })
+);
+
+$("gbSwipeDownBtn").addEventListener("click", () =>
+  act("broadcast swipe down", async () => {
+    const gid = mustGroupSelected();
+    await window.forgeAPI.groupSwipeDir(gid, "down", {
+      ...readFanoutOpts(),
+      durationMs: 220,
+    });
+  })
+);
+
+$("gbSwipeLeftBtn").addEventListener("click", () =>
+  act("broadcast swipe left", async () => {
+    const gid = mustGroupSelected();
+    await window.forgeAPI.groupSwipeDir(gid, "left", {
+      ...readFanoutOpts(),
+      durationMs: 220,
+    });
+  })
+);
+
+$("gbSwipeRightBtn").addEventListener("click", () =>
+  act("broadcast swipe right", async () => {
+    const gid = mustGroupSelected();
+    await window.forgeAPI.groupSwipeDir(gid, "right", {
+      ...readFanoutOpts(),
+      durationMs: 220,
+    });
   })
 );
 
@@ -482,10 +541,25 @@ $("stopBtn").addEventListener("click", () =>
   })
 );
 
+// ===== Single device quick controls =====
 $("wakeBtn").addEventListener("click", () =>
   act("wake", async () => {
     const id = mustSelected();
     await window.forgeAPI.wake(id);
+  })
+);
+
+$("screenOffBtn").addEventListener("click", () =>
+  act("screen off", async () => {
+    const id = mustSelected();
+    await window.forgeAPI.screenOff(id);
+  })
+);
+
+$("shutdownBtn").addEventListener("click", () =>
+  act("shutdown", async () => {
+    const id = mustSelected();
+    await window.forgeAPI.shutdown(id);
   })
 );
 
@@ -581,7 +655,6 @@ $("macroRecStartBtn").addEventListener("click", () =>
   act("macro record start", async () => {
     const id = mustSelected();
 
-    // nếu đang running macro -> chặn
     const st = macroRuntimeByDevice.get(id);
     if (st?.running) throw new Error("Macro is running. Stop first.");
 
@@ -651,7 +724,6 @@ $("macroPlayBtn").addEventListener("click", () =>
     const xyJitterPct = Number($("macroJitterXY").value || 0.0);
     const delayJitterPct = Number($("macroJitterDelay").value || 0.0);
 
-    // optimistic lock UI
     macroRuntimeByDevice.set(id, {
       running: true,
       macroId,
@@ -679,7 +751,7 @@ $("macroStopBtn").addEventListener("click", () =>
   })
 );
 
-// ✅ CORE 4: Group Macro buttons
+// Group Macro
 $("groupMacroPlayBtn").addEventListener("click", () =>
   act("group macro play", async () => {
     const gid = mustGroupSelected();
@@ -724,7 +796,7 @@ $("groupMacroStopSelectedBtn").addEventListener("click", () =>
   })
 );
 
-// ✅ listen macro state/progress from main (single & group share channel)
+// macro state/progress events
 window.forgeAPI.onMacroState((p) => {
   const { deviceId, running, macroId } = p || {};
   if (!deviceId) return;
@@ -772,7 +844,6 @@ async function refreshUI() {
 
   renderDevices(devices);
 
-  // AutoStart no spam
   if ($("autoStartChk").checked) {
     for (const d of devices) {
       if (d.state !== "ONLINE") continue;

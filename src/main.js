@@ -8,15 +8,15 @@ const { DeviceRegistry } = require("./controller/deviceRegistry");
 const { scrcpy } = require("./controller/scrcpyController");
 const input = require("./controller/inputControllerAdb");
 
-// ✅ Core 3
+// Core 3
 const { MacroRecorder } = require("./macro/macroRecorder");
 const { listMacros, loadMacro, saveMacro } = require("./macro/macroStore");
 const { runMacroOnDevice } = require("./macro/macroRunner");
 
-// ✅ V2 Hook
+// V2 Hook
 const { ScrcpyHook } = require("./macro/scrcpyHook");
 
-// ✅ CORE 4
+// Core 4
 const { GroupManager } = require("./controller/groupManager");
 const { GroupBroadcast } = require("./controller/groupBroadcast");
 
@@ -27,11 +27,11 @@ if (require("electron-squirrel-startup")) {
 const registry = new DeviceRegistry();
 let mainWindow = null;
 
-// ✅ Macro state
+// Macro state
 const recorder = new MacroRecorder();
 const hook = new ScrcpyHook();
 
-// running: deviceId -> { stop:boolean, token:number, startedAt:number, macroId:string, ... }
+// running: deviceId -> { stop:boolean, token:number, ... }
 const runningMacroByDevice = new Map();
 
 function sendMacroState(deviceId, state) {
@@ -94,8 +94,8 @@ function normalizeScalePct(pct) {
   return best;
 }
 
-// ===== Device order (drag reorder) =====
-let deviceOrder = []; // array of deviceId (persisted)
+// ===== Device order =====
+let deviceOrder = [];
 function setDeviceOrder(newOrder) {
   if (!Array.isArray(newOrder)) return;
   const seen = new Set();
@@ -121,7 +121,7 @@ function sortDevicesByOrder(devices) {
   });
 }
 
-// ===== layout config (persisted) =====
+// ===== layout config =====
 const layoutConfig = {
   scalePct: 50,
   cols: 4,
@@ -130,7 +130,7 @@ const layoutConfig = {
   forceResizeOnApply: true,
 };
 
-// ===== CORE 4: Groups (persisted) =====
+// ===== Groups (persisted) =====
 let groupManager = new GroupManager([]);
 function getGroupsForSave() {
   return groupManager.toJSON();
@@ -177,7 +177,6 @@ function setLayoutConfig(patch = {}) {
     setDeviceOrder(patch.deviceOrder);
   }
 
-  // allow patch.groups to overwrite groups
   if (patch.groups != null && Array.isArray(patch.groups)) {
     groupManager = new GroupManager(patch.groups);
   }
@@ -186,7 +185,7 @@ function setLayoutConfig(patch = {}) {
 }
 
 // ===== slot manager =====
-const slotByDevice = new Map(); // deviceId -> slotIndex
+const slotByDevice = new Map();
 let nextSlot = 0;
 
 function allocSlot(deviceId) {
@@ -285,13 +284,10 @@ function rawToPct(raw, axisMax) {
     return Math.max(0, Math.min(1, p));
   }
 
-  // px -> pct
   return Math.max(0, Math.min(1, val / axisMax));
 }
 
-// ======================
-// ✅ CORE 4: Broadcast Engine instance
-// ======================
+// ===== Core 4: Broadcast Engine instance =====
 function loadMacroByIdFromStore(id) {
   return loadMacro(app.getPath("userData"), id);
 }
@@ -322,7 +318,6 @@ app.whenReady().then(() => {
       saved.forceResizeOnApply ?? layoutConfig.forceResizeOnApply
     );
 
-    // ✅ groups restore
     if (Array.isArray(saved.groups)) {
       groupManager = new GroupManager(saved.groups);
     }
@@ -521,7 +516,7 @@ app.whenReady().then(() => {
     return { ok: true, count: items.length, forceResize };
   });
 
-  // ===== Control panel actions (ADB shell input) =====
+  // ===== Control panel actions =====
   ipcMain.handle("control:home", async (_, { deviceId }) => {
     const ctx = ensureOnline(registry.get(deviceId));
     return ctx.enqueue(() => input.home(deviceId));
@@ -542,6 +537,17 @@ app.whenReady().then(() => {
     return ctx.enqueue(() => input.wake(deviceId));
   });
 
+  // ✅ new
+  ipcMain.handle("control:screenOff", async (_, { deviceId }) => {
+    const ctx = ensureOnline(registry.get(deviceId));
+    return ctx.enqueue(() => input.screenOff(deviceId));
+  });
+
+  ipcMain.handle("control:shutdown", async (_, { deviceId }) => {
+    const ctx = ensureOnline(registry.get(deviceId));
+    return ctx.enqueue(() => input.shutdown(deviceId));
+  });
+
   ipcMain.handle("control:tapRaw", async (_, { deviceId, x, y }) => {
     const ctx = ensureOnline(registry.get(deviceId));
     return ctx.enqueue(async () => {
@@ -553,7 +559,6 @@ app.whenReady().then(() => {
       const px = rawToPx(x, res.width);
       const py = rawToPx(y, res.height);
 
-      // ✅ If recording, store pct
       if (recorder.isRecording()) {
         const xp = rawToPct(x, res.width);
         const yp = rawToPct(y, res.height);
@@ -579,7 +584,6 @@ app.whenReady().then(() => {
 
       const dur = Number(payload.durationMs) || 220;
 
-      // ✅ If recording, store pct
       if (recorder.isRecording()) {
         const x1p = rawToPct(payload.x1, res.width);
         const y1p = rawToPct(payload.y1, res.height);
@@ -621,12 +625,9 @@ app.whenReady().then(() => {
     });
   });
 
-  // ===== Core 3: Macro IPC =====
-  ipcMain.handle("macro:list", async () => {
-    return listMacros(app.getPath("userData"));
-  });
+  // ===== Macro IPC (giữ nguyên phần Core 3 như bạn đang dùng) =====
+  ipcMain.handle("macro:list", async () => listMacros(app.getPath("userData")));
 
-  // ✅ Record start (V2: hook global mouse on scrcpy window)
   ipcMain.handle("macro:recordStart", async (_, { deviceId }) => {
     const ctx = ensureOnline(registry.get(deviceId));
     const snap = ctx.snapshot();
@@ -635,21 +636,17 @@ app.whenReady().then(() => {
       throw new Error("Device resolution not ready yet");
 
     const running = scrcpy.isRunning(deviceId);
-    if (!running) {
+    if (!running)
       throw new Error(
         "scrcpy is not running for this device. Start scrcpy first."
       );
-    }
 
-    // start macro recorder
     recorder.start({ deviceId, deviceRes: res });
 
-    // start hook: mouse => recorder steps (TAP/SWIPE/LONG_PRESS)
     hook.start({
       deviceId,
       deviceRes: res,
       onStep: (s) => {
-        // recorder expects "pct steps"
         if (s.type === "TAP") recorder.recordTapPct(s.xPct, s.yPct);
         if (s.type === "LONG_PRESS")
           recorder.recordLongPressPct(s.xPct, s.yPct, s.durationMs);
@@ -671,7 +668,6 @@ app.whenReady().then(() => {
     try {
       hook.stop();
     } catch {}
-
     const { steps } = recorder.stop();
     return { ok: true, steps };
   });
@@ -720,19 +716,17 @@ app.whenReady().then(() => {
     return loadMacro(app.getPath("userData"), id);
   });
 
-  // ✅ Play: anti-spam + progress + hard stop
   ipcMain.handle("macro:play", async (_, { deviceId, macroId, options }) => {
     const ctx = ensureOnline(registry.get(deviceId));
     const macro = loadMacro(app.getPath("userData"), macroId);
 
-    // ✅ reject if already running
     if (runningMacroByDevice.has(deviceId)) {
       throw new Error("Macro already running on this device. Stop it first.");
     }
 
     const state = {
       stop: false,
-      token: Date.now(), // run token
+      token: Date.now(),
       startedAt: Date.now(),
       macroId,
       source: "single",
@@ -768,22 +762,19 @@ app.whenReady().then(() => {
     const s = runningMacroByDevice.get(deviceId);
     if (s) {
       s.stop = true;
-      // đổi token để mọi retry/loop exit
       s.token = Date.now();
     }
     return { ok: true };
   });
 
   // ======================
-  // ✅ CORE 4: Group IPC
+  // Groups IPC
   // ======================
   function persistSettings() {
     writeSettingsFile({ v: 2, ...getLayoutConfig() });
   }
 
-  ipcMain.handle("group:list", async () => {
-    return groupManager.list();
-  });
+  ipcMain.handle("group:list", async () => groupManager.list());
 
   ipcMain.handle("group:create", async (_, { id, name }) => {
     const g = groupManager.create(id, name);
@@ -821,7 +812,7 @@ app.whenReady().then(() => {
     return { ok: true };
   });
 
-  // ---- Broadcast Engine ----
+  // ---- Group Broadcast ----
   ipcMain.handle("group:tapPct", async (_, { groupId, xPct, yPct, opts }) => {
     return groupBroadcast.tapPct(
       groupId,
@@ -846,8 +837,24 @@ app.whenReady().then(() => {
     }
   );
 
+  ipcMain.handle("group:swipeDir", async (_, { groupId, dir, opts }) => {
+    return groupBroadcast.swipeDir(groupId, dir, opts || {});
+  });
+
   ipcMain.handle("group:key", async (_, { groupId, key, opts }) => {
     return groupBroadcast.key(groupId, key, opts || {});
+  });
+
+  ipcMain.handle("group:wake", async (_, { groupId, opts }) => {
+    return groupBroadcast.wake(groupId, opts || {});
+  });
+
+  ipcMain.handle("group:screenOff", async (_, { groupId, opts }) => {
+    return groupBroadcast.screenOff(groupId, opts || {});
+  });
+
+  ipcMain.handle("group:shutdown", async (_, { groupId, opts }) => {
+    return groupBroadcast.shutdown(groupId, opts || {});
   });
 
   // ---- Group Macro ----

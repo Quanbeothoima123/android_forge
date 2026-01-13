@@ -1,3 +1,4 @@
+<!-- src/index.html -->
 <!doctype html>
 <html>
 
@@ -54,7 +55,7 @@
         }
 
         #devices {
-            max-height: 520px;
+            max-height: 420px;
             overflow: auto;
         }
 
@@ -139,6 +140,10 @@
             width: 220px;
         }
 
+        input.w260 {
+            width: 260px;
+        }
+
         .hr {
             height: 1px;
             background: #eee;
@@ -150,6 +155,31 @@
             border-radius: 999px;
             background: #f6f6f6;
             font-size: 12px;
+        }
+
+        #groupDevicesPanel {
+            max-height: 160px;
+            overflow: auto;
+            border: 1px solid #eee;
+            border-radius: 8px;
+            padding: 8px;
+            background: #fff;
+        }
+
+        .gRow {
+            display: flex;
+            justify-content: space-between;
+            gap: 8px;
+            padding: 6px;
+            border-bottom: 1px solid #f2f2f2;
+        }
+
+        .gRow:last-child {
+            border-bottom: none;
+        }
+
+        .gTitle {
+            font-weight: 700;
         }
     </style>
 </head>
@@ -181,7 +211,7 @@
             <!-- Groups -->
             <div class="sectionTitle">Groups (Core 4)</div>
             <div class="inline small">
-                <select id="groupSel" class="w220"></select>
+                <select id="groupSel" class="w260"></select>
                 <button id="groupReloadBtn">Reload</button>
             </div>
 
@@ -189,11 +219,11 @@
                 <input id="groupId" class="w120" placeholder="group id" />
                 <input id="groupName" class="w220" placeholder="group name" />
                 <button id="groupCreateBtn">Create</button>
-                <button id="groupRenameBtn">Rename</button>
-                <button id="groupRemoveBtn">Remove</button>
             </div>
 
             <div class="inline small" style="margin-top:8px;">
+                <button id="groupRenameBtn">Rename</button>
+                <button id="groupRemoveBtn">Remove</button>
                 <button id="groupAddSelectedBtn">Add selected → group</button>
                 <button id="groupRemoveSelectedBtn">Remove selected ← group</button>
             </div>
@@ -226,6 +256,10 @@
                 <div></div>
             </div>
 
+            <!-- ✅ Group Devices Panel -->
+            <div class="sectionTitle">Devices in selected group</div>
+            <div id="groupDevicesPanel" class="muted small">(chọn group để xem danh sách thiết bị)</div>
+
             <div class="hr"></div>
 
             <div id="devices" class="muted">(loading...)</div>
@@ -235,6 +269,15 @@
             <h2 style="margin:0 0 10px 0;">Selected Device</h2>
 
             <div id="selectedInfo" class="muted">(chọn thiết bị bên trái)</div>
+
+            <!-- ✅ Alias editor -->
+            <div class="sectionTitle">Device Alias (Tên riêng)</div>
+            <div class="inline small">
+                <input id="aliasInput" class="w260" placeholder="VD: Máy test A / Máy công ty ..." />
+                <button id="aliasSaveBtn">Save Alias</button>
+                <button id="aliasClearBtn">Clear</button>
+                <span class="muted">Lưu vào settings.json, tự load khi cắm lại.</span>
+            </div>
 
             <div class="sectionTitle">Layout & Scale</div>
             <div class="inline small">

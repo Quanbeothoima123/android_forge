@@ -32,6 +32,9 @@ let layoutState = {
   forceResizeOnApply: true,
   deviceOrder: [],
   groups: [],
+  broadcastDefaults: { baseDelayMs: 90, jitterMs: 160, xyJitterPct: 0.004 },
+  groupMacroDefaults: { baseDelayMs: 120, jitterMs: 280 },
+  deviceAliases: {},
 };
 
 // Drag reorder local working list (device ids in UI order)
@@ -41,9 +44,17 @@ let uiOrder = [];
 let recordedSteps = [];
 const macroRuntimeByDevice = new Map();
 
+// ✅ NEW: track running->stopped transitions for logging "done"
+const macroPrevRunningByDevice = new Map(); // deviceId -> boolean
+
 // ===== Groups =====
 let groups = [];
 let selectedGroupId = "";
+
+// ✅ Alias edit guard / draft
+let aliasDraftByDevice = new Map(); // deviceId -> current typed text
+let aliasDirtyDeviceId = ""; // which device is being edited
+let lastSelectedDeviceIdForAlias = ""; // to detect device change
 
 function setMacroUiEnabled(enabled) {
   $("macroPlayBtn").disabled = !enabled;
@@ -89,12 +100,30 @@ async function pullLayoutFromMain() {
     $("gridMargin").value = String(layoutState.margin ?? 8);
     $("forceResizeChk").checked = !!layoutState.forceResizeOnApply;
 
+    // ✅ load persisted broadcast defaults to UI
+    const bd = layoutState.broadcastDefaults || {};
+    if (bd.baseDelayMs != null) $("gbBaseDelay").value = String(bd.baseDelayMs);
+    if (bd.jitterMs != null) $("gbJitter").value = String(bd.jitterMs);
+    if (bd.xyJitterPct != null) $("gbXyJitter").value = String(bd.xyJitterPct);
+
+    // ✅ load persisted group macro defaults to UI
+    const gd = layoutState.groupMacroDefaults || {};
+    if (gd.baseDelayMs != null) $("gmBaseDelay").value = String(gd.baseDelayMs);
+    if (gd.jitterMs != null) $("gmJitter").value = String(gd.jitterMs);
+
     if (Array.isArray(layoutState.deviceOrder)) {
       uiOrder = [...layoutState.deviceOrder];
     }
 
     if (Array.isArray(layoutState.groups)) {
       groups = [...layoutState.groups];
+    }
+
+    if (
+      layoutState.deviceAliases &&
+      typeof layoutState.deviceAliases === "object"
+    ) {
+      layoutState.deviceAliases = { ...layoutState.deviceAliases };
     }
   } catch {}
 }
@@ -138,6 +167,12 @@ function sortDevicesForRender(devices) {
 
 let dragSrcId = "";
 
+function getDisplayName(d) {
+  const alias = String(d?.alias || "").trim();
+  if (alias) return alias;
+  return d?.model || d?.deviceId || "Unknown";
+}
+
 function renderDevices(devices) {
   const wrap = $("devices");
   wrap.innerHTML = "";
@@ -159,12 +194,16 @@ function renderDevices(devices) {
     const badgeClass = d.agentReady ? "badge ok" : "badge bad";
     const badgeText = d.agentReady ? "READY" : "AGENT OFF";
 
+    const title = getDisplayName(d);
+    const sub = d.model && d.alias ? `Model: ${d.model}` : "";
+
     div.innerHTML = `
       <div style="display:flex; justify-content:space-between; gap:8px; align-items:center;">
         <div style="min-width:0;">
           <div style="font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
-            ${d.model || d.deviceId}
+            ${title}
           </div>
+          ${sub ? `<div class="kv muted">${sub}</div>` : ""}
           <div class="kv muted mono" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
             ${d.deviceId}
           </div>
@@ -244,22 +283,104 @@ function renderDevices(devices) {
   }
 }
 
+function renderGroupDevicesPanel() {
+  const panel = $("groupDevicesPanel");
+  const gid = String(selectedGroupId || $("groupSel").value || "").trim();
+  if (!gid) {
+    panel.textContent = "(chọn group để xem danh sách thiết bị)";
+    return;
+  }
+
+  const g = groups.find((x) => x.id === gid);
+  if (!g) {
+    panel.textContent = "(group không tồn tại)";
+    return;
+  }
+
+  const ids = Array.isArray(g.devices) ? g.devices : [];
+  if (!ids.length) {
+    panel.textContent = "(group rỗng)";
+    return;
+  }
+
+  const rows = [];
+  for (const did of ids) {
+    const d = devicesById.get(did);
+    const alias = d?.alias || layoutState.deviceAliases?.[did] || "";
+    const title = alias ? alias : d?.model || did;
+
+    const state = d?.state || "OFFLINE";
+    const badge =
+      state === "ONLINE"
+        ? `<span class="badge ok">ONLINE</span>`
+        : `<span class="badge bad">${state}</span>`;
+    const model = d?.model ? ` • ${d.model}` : "";
+
+    rows.push(`
+      <div class="gRow">
+        <div style="min-width:0;">
+          <div class="gTitle" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${title}</div>
+          <div class="muted small mono" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${did}</div>
+          <div class="muted small">Android ${d?.androidVersion || "?"}${model}</div>
+        </div>
+        <div>${badge}</div>
+      </div>
+    `);
+  }
+
+  panel.innerHTML = rows.join("");
+}
+
 async function updateSelectedInfo() {
+  const aliasInput = $("aliasInput");
+
   if (!selectedDeviceId) {
     $("selectedInfo").textContent = "(chọn thiết bị bên trái)";
     $("runningBadge").textContent = "RUNNING: ?";
+    if (aliasInput) aliasInput.value = "";
     renderMacroStatus("");
+    lastSelectedDeviceIdForAlias = "";
     return;
   }
 
   const d = devicesById.get(selectedDeviceId);
   if (!d) return;
 
+  const title = getDisplayName(d);
+
   $("selectedInfo").innerHTML = `
-    <div><b>${d.model || selectedDeviceId}</b></div>
+    <div><b>${title}</b></div>
     <div class="muted mono">${selectedDeviceId}</div>
     <div class="muted">State: ${d.state} • Android ${d.androidVersion || "?"} • Res: ${fmtRes(d)} • AgentReady: ${d.agentReady ? "YES" : "NO"}</div>
+    ${d.model ? `<div class="muted small">Model: ${d.model}</div>` : ""}
   `;
+
+  // ✅ FIX: chỉ update aliasInput.value nếu user không đang gõ
+  const deviceChanged = lastSelectedDeviceIdForAlias !== selectedDeviceId;
+  lastSelectedDeviceIdForAlias = selectedDeviceId;
+
+  if (aliasInput) {
+    const isFocused = document.activeElement === aliasInput;
+    const isDirtyThisDevice = aliasDirtyDeviceId === selectedDeviceId;
+
+    // nguồn alias chuẩn từ device snapshot
+    const stableAlias = String(d.alias || "").trim();
+
+    // nếu device đổi -> ưu tiên show alias đúng ngay
+    if (deviceChanged) {
+      aliasDirtyDeviceId = ""; // reset dirty when switching device
+      const draft = aliasDraftByDevice.get(selectedDeviceId);
+      aliasInput.value = draft != null ? draft : stableAlias;
+    } else {
+      // same device
+      if (isFocused || isDirtyThisDevice) {
+        // user đang gõ -> KHÔNG overwrite
+      } else {
+        // không gõ -> sync theo stable
+        aliasInput.value = stableAlias;
+      }
+    }
+  }
 
   try {
     const running = await window.forgeAPI.scrcpyIsRunning(selectedDeviceId);
@@ -311,6 +432,12 @@ function readFanoutOpts() {
   return { baseDelayMs, jitterMs, xyJitterPct };
 }
 
+function readGroupMacroDefaults() {
+  const baseDelayMs = Number($("gmBaseDelay").value || 120);
+  const jitterMs = Number($("gmJitter").value || 280);
+  return { baseDelayMs, jitterMs };
+}
+
 async function act(name, fn) {
   try {
     await fn();
@@ -319,6 +446,14 @@ async function act(name, fn) {
   } catch (e) {
     log(`${name} failed: ${e.message}`, true);
   }
+}
+
+// ✅ auto-save broadcast settings (persist)
+async function persistBroadcastDefaults() {
+  await pushLayoutToMain({ broadcastDefaults: readFanoutOpts() });
+}
+async function persistGroupMacroDefaults() {
+  await pushLayoutToMain({ groupMacroDefaults: readGroupMacroDefaults() });
 }
 
 // ===== Groups UI =====
@@ -343,7 +478,10 @@ async function reloadGroups() {
 
   sel.onchange = () => {
     selectedGroupId = sel.value;
+    renderGroupDevicesPanel();
   };
+
+  renderGroupDevicesPanel();
 }
 
 $("groupReloadBtn").addEventListener("click", () =>
@@ -398,6 +536,78 @@ $("groupRemoveSelectedBtn").addEventListener("click", () =>
   })
 );
 
+// ✅ broadcast input changes => persist
+["gbBaseDelay", "gbJitter", "gbXyJitter"].forEach((id) => {
+  $(id).addEventListener("change", () => persistBroadcastDefaults());
+  $(id).addEventListener("input", () => persistBroadcastDefaults());
+});
+
+// ✅ group macro defaults persist
+["gmBaseDelay", "gmJitter"].forEach((id) => {
+  $(id).addEventListener("change", () => persistGroupMacroDefaults());
+  $(id).addEventListener("input", () => persistGroupMacroDefaults());
+});
+
+// ✅ Alias typing hooks (FIX core)
+(function initAliasHooks() {
+  const inp = $("aliasInput");
+  if (!inp) return;
+
+  inp.addEventListener("focus", () => {
+    // mark dirty for current device if user intends to edit
+    if (selectedDeviceId) aliasDirtyDeviceId = selectedDeviceId;
+  });
+
+  inp.addEventListener("input", () => {
+    if (!selectedDeviceId) return;
+    aliasDirtyDeviceId = selectedDeviceId;
+    aliasDraftByDevice.set(selectedDeviceId, String(inp.value || ""));
+  });
+
+  inp.addEventListener("blur", () => {
+    // keep draft, but allow UI to sync later if not dirty
+    // (dirty flag remains until save/clear, so it won't overwrite)
+  });
+})();
+
+// ===== Alias save/clear =====
+$("aliasSaveBtn").addEventListener("click", () =>
+  act("save alias", async () => {
+    const did = selectedDeviceId;
+    if (!did) throw new Error("Chưa chọn thiết bị");
+    const alias = String($("aliasInput").value || "").trim();
+    const r = await window.forgeAPI.deviceAliasSet(did, alias);
+
+    // local cache
+    if (alias) layoutState.deviceAliases[did] = alias;
+    else delete layoutState.deviceAliases[did];
+
+    // ✅ clear dirty/draft so refresh can sync stable
+    aliasDirtyDeviceId = "";
+    aliasDraftByDevice.delete(did);
+
+    log(`Alias saved: ${did} = "${r.alias || ""}"`);
+    renderGroupDevicesPanel();
+  })
+);
+
+$("aliasClearBtn").addEventListener("click", () =>
+  act("clear alias", async () => {
+    const did = selectedDeviceId;
+    if (!did) throw new Error("Chưa chọn thiết bị");
+    await window.forgeAPI.deviceAliasSet(did, "");
+    delete layoutState.deviceAliases[did];
+    $("aliasInput").value = "";
+
+    // ✅ clear dirty/draft
+    aliasDirtyDeviceId = "";
+    aliasDraftByDevice.delete(did);
+
+    log(`Alias cleared: ${did}`);
+    renderGroupDevicesPanel();
+  })
+);
+
 // ===== Group Broadcast buttons =====
 $("gbHomeBtn").addEventListener("click", () =>
   act("broadcast HOME", async () => {
@@ -437,7 +647,6 @@ $("gbScreenOffBtn").addEventListener("click", () =>
 $("gbShutdownBtn").addEventListener("click", () =>
   act("broadcast SHUTDOWN", async () => {
     const gid = mustGroupSelected();
-    // avoid misclick? vẫn chạy thẳng theo yêu cầu bạn
     await window.forgeAPI.groupShutdown(gid, readFanoutOpts());
   })
 );
@@ -766,6 +975,9 @@ $("groupMacroPlayBtn").addEventListener("click", () =>
     const gmBaseDelay = Number($("gmBaseDelay").value || 120);
     const gmJitter = Number($("gmJitter").value || 280);
 
+    // persist defaults
+    await persistGroupMacroDefaults();
+
     const r = await window.forgeAPI.groupMacroPlay(
       gid,
       macroId,
@@ -800,14 +1012,27 @@ $("groupMacroStopSelectedBtn").addEventListener("click", () =>
 window.forgeAPI.onMacroState((p) => {
   const { deviceId, running, macroId } = p || {};
   if (!deviceId) return;
+
+  const prevRunning = !!macroPrevRunningByDevice.get(deviceId);
+  const nextRunning = !!running;
+
+  // ✅ LOG: when a macro finishes/stops on any device (single or group)
+  if (prevRunning && !nextRunning) {
+    const d = devicesById.get(deviceId);
+    const name = getDisplayName(d || { deviceId });
+    log(`Macro finished/stopped on ${name} (${deviceId})`);
+  }
+
+  macroPrevRunningByDevice.set(deviceId, nextRunning);
+
   const cur = macroRuntimeByDevice.get(deviceId) || {};
   macroRuntimeByDevice.set(deviceId, {
     ...cur,
-    running: !!running,
+    running: nextRunning,
     macroId: macroId || cur.macroId || "",
-    stepIndex: running ? (cur.stepIndex ?? 0) : 0,
-    stepCount: running ? (cur.stepCount ?? "?") : 0,
-    stepType: running ? (cur.stepType ?? "") : "",
+    stepIndex: nextRunning ? (cur.stepIndex ?? 0) : 0,
+    stepCount: nextRunning ? (cur.stepCount ?? "?") : 0,
+    stepType: nextRunning ? (cur.stepType ?? "") : "",
   });
 
   if (deviceId === selectedDeviceId) renderMacroStatus(deviceId);
@@ -833,7 +1058,11 @@ async function refreshUI() {
   const devices = await window.forgeAPI.listDevices();
 
   devicesById.clear();
-  for (const d of devices) devicesById.set(d.deviceId, d);
+  for (const d of devices) {
+    devicesById.set(d.deviceId, d);
+    // keep local alias cache
+    if (d.alias) layoutState.deviceAliases[d.deviceId] = d.alias;
+  }
 
   ensureInUiOrder(devices);
 
@@ -843,6 +1072,9 @@ async function refreshUI() {
   }
 
   renderDevices(devices);
+
+  // group panel updates with latest ONLINE/OFFLINE + alias
+  renderGroupDevicesPanel();
 
   if ($("autoStartChk").checked) {
     for (const d of devices) {
@@ -876,7 +1108,9 @@ window.forgeAPI.onScrcpyClosed(({ deviceId, code, signal }) => {
 });
 
 (async function boot() {
-  log("Control Panel loaded. Core 3 macro enabled (V2 hook) + Core 4 groups.");
+  log(
+    "Control Panel loaded. Alias input now guarded (won't be overwritten while typing)."
+  );
   await pullLayoutFromMain();
   await reloadGroups();
   await refreshUI();

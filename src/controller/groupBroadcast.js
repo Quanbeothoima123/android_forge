@@ -7,6 +7,20 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// ✅ NEW: interruptible sleep for start delay so stopGroup stops fast even during fanout delay
+async function sleepInterruptible(totalMs, shouldStop, tickMs = 60) {
+  let remain = Math.max(0, Number(totalMs) || 0);
+  const tick = Math.max(15, Number(tickMs) || 60);
+
+  while (remain > 0) {
+    if (shouldStop && shouldStop()) return false;
+    const s = Math.min(remain, tick);
+    await sleep(s);
+    remain -= s;
+  }
+  return true;
+}
+
 function clamp01(x) {
   return Math.max(0, Math.min(1, x));
 }
@@ -232,6 +246,7 @@ class GroupBroadcast {
       const ctx = this.registry.get(deviceId);
       if (!ctx || ctx.state !== "ONLINE") continue;
 
+      // If already running on this device, skip (single or other group)
       if (this.runningMacroByDevice.has(deviceId)) continue;
 
       const state = {
@@ -261,20 +276,26 @@ class GroupBroadcast {
 
       ctx
         .enqueue(async () => {
-          await sleep(delay);
+          const shouldStop = () => {
+            const curGroup = this.runningByGroup.get(groupId);
+            if (!curGroup || curGroup.runId !== runId) return true;
+            const st = curGroup.states.get(deviceId);
+            const lock = this.runningMacroByDevice.get(deviceId);
+            return !!(st?.stop || lock?.stop);
+          };
+
+          // ✅ interruptible start delay (stopGroup will cancel quickly)
+          const ok = await sleepInterruptible(delay, shouldStop, 60);
+          if (!ok) return { ok: false, stoppedBeforeStart: true };
+
+          if (shouldStop()) return { ok: false, stoppedBeforeRun: true };
 
           try {
             await runMacroOnDevice(ctx, macro, options || {}, {
-              shouldStop: () => {
-                const curGroup = this.runningByGroup.get(groupId);
-                if (!curGroup || curGroup.runId !== runId) return true;
-                const st = curGroup.states.get(deviceId);
-                const lock = this.runningMacroByDevice.get(deviceId);
-                return !!(st?.stop || lock?.stop);
-              },
+              shouldStop,
               token: runId,
               onProgress: (p) => {
-                this.sendMacroProgress(deviceId, p);
+                this.sendMacroProgress(deviceId, { deviceId, ...p });
               },
             });
 
@@ -290,6 +311,7 @@ class GroupBroadcast {
               if (cur.states.size === 0) this.runningByGroup.delete(groupId);
             }
 
+            // ✅ Ensure UI receives "finished/stopped" signal
             this.sendMacroState(deviceId, { running: false, macroId: "" });
           }
         })

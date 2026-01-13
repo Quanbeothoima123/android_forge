@@ -130,8 +130,24 @@ const layoutConfig = {
   forceResizeOnApply: true,
 };
 
+// ✅ persist: broadcast defaults + group macro defaults + device aliases
+let broadcastDefaults = {
+  baseDelayMs: 90,
+  jitterMs: 160,
+  xyJitterPct: 0.004,
+};
+
+let groupMacroDefaults = {
+  baseDelayMs: 120,
+  jitterMs: 280,
+};
+
+// deviceId -> alias
+let deviceAliases = {}; // { [deviceId]: "My Name" }
+
 // ===== Groups (persisted) =====
 let groupManager = new GroupManager([]);
+
 function getGroupsForSave() {
   return groupManager.toJSON();
 }
@@ -141,7 +157,14 @@ function getLayoutConfig() {
     ...layoutConfig,
     deviceOrder,
     groups: getGroupsForSave(),
+    broadcastDefaults,
+    groupMacroDefaults,
+    deviceAliases,
   };
+}
+
+function persistSettings() {
+  writeSettingsFile({ v: 3, ...getLayoutConfig() });
 }
 
 function setLayoutConfig(patch = {}) {
@@ -181,7 +204,55 @@ function setLayoutConfig(patch = {}) {
     groupManager = new GroupManager(patch.groups);
   }
 
-  writeSettingsFile({ v: 2, ...getLayoutConfig() });
+  // ✅ broadcast defaults (persist)
+  if (patch.broadcastDefaults && typeof patch.broadcastDefaults === "object") {
+    const bd = patch.broadcastDefaults;
+    if (bd.baseDelayMs != null)
+      broadcastDefaults.baseDelayMs = Math.max(0, Number(bd.baseDelayMs) || 0);
+    if (bd.jitterMs != null)
+      broadcastDefaults.jitterMs = Math.max(0, Number(bd.jitterMs) || 0);
+    if (bd.xyJitterPct != null)
+      broadcastDefaults.xyJitterPct = Math.max(0, Number(bd.xyJitterPct) || 0);
+  }
+
+  // ✅ group macro defaults (persist)
+  if (
+    patch.groupMacroDefaults &&
+    typeof patch.groupMacroDefaults === "object"
+  ) {
+    const gd = patch.groupMacroDefaults;
+    if (gd.baseDelayMs != null)
+      groupMacroDefaults.baseDelayMs = Math.max(0, Number(gd.baseDelayMs) || 0);
+    if (gd.jitterMs != null)
+      groupMacroDefaults.jitterMs = Math.max(0, Number(gd.jitterMs) || 0);
+  }
+
+  // ✅ device aliases (persist) — allow bulk overwrite
+  if (patch.deviceAliases && typeof patch.deviceAliases === "object") {
+    deviceAliases = { ...deviceAliases, ...patch.deviceAliases };
+    // cleanup invalid
+    for (const k of Object.keys(deviceAliases)) {
+      const v = String(deviceAliases[k] ?? "").trim();
+      if (!v) delete deviceAliases[k];
+      else deviceAliases[k] = v;
+    }
+  }
+
+  persistSettings();
+}
+
+function setDeviceAlias(deviceId, alias) {
+  const did = String(deviceId || "").trim();
+  if (!did) throw new Error("deviceId required");
+  const a = String(alias ?? "").trim();
+
+  if (!a) {
+    delete deviceAliases[did];
+  } else {
+    deviceAliases[did] = a;
+  }
+  persistSettings();
+  return { ok: true, deviceId: did, alias: deviceAliases[did] || "" };
 }
 
 // ===== slot manager =====
@@ -321,6 +392,31 @@ app.whenReady().then(() => {
     if (Array.isArray(saved.groups)) {
       groupManager = new GroupManager(saved.groups);
     }
+
+    // ✅ load persisted defaults
+    if (
+      saved.broadcastDefaults &&
+      typeof saved.broadcastDefaults === "object"
+    ) {
+      broadcastDefaults = { ...broadcastDefaults, ...saved.broadcastDefaults };
+    }
+    if (
+      saved.groupMacroDefaults &&
+      typeof saved.groupMacroDefaults === "object"
+    ) {
+      groupMacroDefaults = {
+        ...groupMacroDefaults,
+        ...saved.groupMacroDefaults,
+      };
+    }
+    if (saved.deviceAliases && typeof saved.deviceAliases === "object") {
+      deviceAliases = { ...saved.deviceAliases };
+      for (const k of Object.keys(deviceAliases)) {
+        const v = String(deviceAliases[k] ?? "").trim();
+        if (!v) delete deviceAliases[k];
+        else deviceAliases[k] = v;
+      }
+    }
   }
 
   initGroupBroadcast();
@@ -337,7 +433,21 @@ app.whenReady().then(() => {
   // ===== devices =====
   ipcMain.handle("devices:list", async () => {
     const list = registry.listSnapshots();
-    return sortDevicesByOrder(list);
+    const sorted = sortDevicesByOrder(list);
+    // enrich alias
+    return sorted.map((d) => ({
+      ...d,
+      alias: deviceAliases[d.deviceId] || "",
+    }));
+  });
+
+  // ✅ alias get/set
+  ipcMain.handle("device:aliasSet", async (_, { deviceId, alias }) => {
+    return setDeviceAlias(deviceId, alias);
+  });
+
+  ipcMain.handle("device:aliasGetAll", async () => {
+    return { ...deviceAliases };
   });
 
   // ===== layout config =====
@@ -350,7 +460,7 @@ app.whenReady().then(() => {
   function ensureInOrder(deviceId) {
     if (!deviceOrder.includes(deviceId)) {
       deviceOrder.push(deviceId);
-      writeSettingsFile({ v: 2, ...getLayoutConfig() });
+      persistSettings();
     }
   }
 
@@ -537,7 +647,6 @@ app.whenReady().then(() => {
     return ctx.enqueue(() => input.wake(deviceId));
   });
 
-  // ✅ new
   ipcMain.handle("control:screenOff", async (_, { deviceId }) => {
     const ctx = ensureOnline(registry.get(deviceId));
     return ctx.enqueue(() => input.screenOff(deviceId));
@@ -625,7 +734,7 @@ app.whenReady().then(() => {
     });
   });
 
-  // ===== Macro IPC (giữ nguyên phần Core 3 như bạn đang dùng) =====
+  // ===== Macro IPC =====
   ipcMain.handle("macro:list", async () => listMacros(app.getPath("userData")));
 
   ipcMain.handle("macro:recordStart", async (_, { deviceId }) => {
@@ -770,10 +879,6 @@ app.whenReady().then(() => {
   // ======================
   // Groups IPC
   // ======================
-  function persistSettings() {
-    writeSettingsFile({ v: 2, ...getLayoutConfig() });
-  }
-
   ipcMain.handle("group:list", async () => groupManager.list());
 
   ipcMain.handle("group:create", async (_, { id, name }) => {

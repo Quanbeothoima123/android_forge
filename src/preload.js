@@ -4,6 +4,11 @@ const { contextBridge, ipcRenderer } = require("electron");
 contextBridge.exposeInMainWorld("forgeAPI", {
   listDevices: () => ipcRenderer.invoke("devices:list"),
 
+  // ✅ device alias
+  deviceAliasSet: (deviceId, alias) =>
+    ipcRenderer.invoke("device:aliasSet", { deviceId, alias }),
+  deviceAliasGetAll: () => ipcRenderer.invoke("device:aliasGetAll"),
+
   // layout
   getLayout: () => ipcRenderer.invoke("layout:get"),
   setLayout: (patch) => ipcRenderer.invoke("layout:set", patch),
@@ -28,7 +33,6 @@ contextBridge.exposeInMainWorld("forgeAPI", {
   recents: (deviceId) => ipcRenderer.invoke("control:recents", { deviceId }),
   wake: (deviceId) => ipcRenderer.invoke("control:wake", { deviceId }),
 
-  // ✅ new: screen off + shutdown
   screenOff: (deviceId) =>
     ipcRenderer.invoke("control:screenOff", { deviceId }),
   shutdown: (deviceId) => ipcRenderer.invoke("control:shutdown", { deviceId }),
@@ -105,7 +109,6 @@ contextBridge.exposeInMainWorld("forgeAPI", {
   groupKey: (groupId, key, opts) =>
     ipcRenderer.invoke("group:key", { groupId, key, opts }),
 
-  // ✅ new: group wake/screenOff/shutdown
   groupWake: (groupId, opts) =>
     ipcRenderer.invoke("group:wake", { groupId, opts }),
   groupScreenOff: (groupId, opts) =>

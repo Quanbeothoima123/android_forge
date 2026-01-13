@@ -1,3 +1,4 @@
+// controller/deviceManager.js
 const { runAdb } = require("./adb");
 
 const AGENT_ACCESSIBILITY_ID =

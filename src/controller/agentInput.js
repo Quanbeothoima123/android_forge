@@ -1,3 +1,4 @@
+// controller/agentInput.js
 const { ensureForward, sendJson } = require("./socketClient");
 
 const BASE_HOST_PORT = 28100; // host port base, per device slot

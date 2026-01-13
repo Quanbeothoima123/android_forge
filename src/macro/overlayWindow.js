@@ -1,3 +1,4 @@
+// macro/overlayWindow.js
 const { BrowserWindow } = require("electron");
 
 function createOverlay() {

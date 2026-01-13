@@ -1,3 +1,4 @@
+// controller/inputControllerSmart.js
 const adb = require("./inputControllerAdb");
 const agent = require("./agentInput");
 

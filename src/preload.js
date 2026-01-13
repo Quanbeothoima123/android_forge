@@ -1,6 +1,5 @@
 // src/preload.js
 const { contextBridge, ipcRenderer } = require("electron");
-
 contextBridge.exposeInMainWorld("forgeAPI", {
   listDevices: () => ipcRenderer.invoke("devices:list"),
 

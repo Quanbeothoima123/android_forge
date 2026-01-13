@@ -1,3 +1,4 @@
+// controller/adb.js
 const { spawn } = require("child_process");
 
 function runAdb(args, timeoutMs = 8000) {

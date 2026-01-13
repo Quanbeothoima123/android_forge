@@ -1,3 +1,4 @@
+// controller/winRectByTitle.js
 const { spawn } = require("child_process");
 
 function toPsEncodedCommand(psScript) {

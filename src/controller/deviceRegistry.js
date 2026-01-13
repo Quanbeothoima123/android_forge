@@ -1,3 +1,4 @@
+// controller/deviceRegistry.js
 const {
   listDevicesRaw,
   fetchDeviceInfo,

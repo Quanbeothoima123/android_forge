@@ -1,5 +1,6 @@
 // src/preload.js
 const { contextBridge, ipcRenderer } = require("electron");
+
 contextBridge.exposeInMainWorld("forgeAPI", {
   listDevices: () => ipcRenderer.invoke("devices:list"),
 
@@ -43,7 +44,7 @@ contextBridge.exposeInMainWorld("forgeAPI", {
   swipeDir: (deviceId, dir) =>
     ipcRenderer.invoke("control:swipeDir", { deviceId, dir }),
 
-  // ✅ macros
+  // ✅ macros (single device)
   listMacros: () => ipcRenderer.invoke("macro:list"),
   macroRecordStart: (deviceId) =>
     ipcRenderer.invoke("macro:recordStart", { deviceId }),
@@ -60,11 +61,55 @@ contextBridge.exposeInMainWorld("forgeAPI", {
     ipcRenderer.invoke("macro:play", { deviceId, macroId, options }),
   macroStop: (deviceId) => ipcRenderer.invoke("macro:stop", { deviceId }),
 
-  // ✅ realtime macro state/progress
+  // ✅ realtime macro state/progress (shared for single & group)
   onMacroState: (cb) => {
     ipcRenderer.on("macro:state", (_, payload) => cb(payload));
   },
   onMacroProgress: (cb) => {
     ipcRenderer.on("macro:progress", (_, payload) => cb(payload));
   },
+
+  // ======================
+  // ✅ CORE 4: Groups
+  // ======================
+  groupList: () => ipcRenderer.invoke("group:list"),
+  groupCreate: (id, name) => ipcRenderer.invoke("group:create", { id, name }),
+  groupRename: (id, name) => ipcRenderer.invoke("group:rename", { id, name }),
+  groupRemove: (id) => ipcRenderer.invoke("group:remove", { id }),
+
+  groupAddDevice: (groupId, deviceId) =>
+    ipcRenderer.invoke("group:addDevice", { groupId, deviceId }),
+  groupRemoveDevice: (groupId, deviceId) =>
+    ipcRenderer.invoke("group:removeDevice", { groupId, deviceId }),
+
+  // Broadcast Engine
+  groupTapPct: (groupId, xPct, yPct, opts) =>
+    ipcRenderer.invoke("group:tapPct", { groupId, xPct, yPct, opts }),
+  groupSwipePct: (groupId, x1Pct, y1Pct, x2Pct, y2Pct, durationMs, opts) =>
+    ipcRenderer.invoke("group:swipePct", {
+      groupId,
+      x1Pct,
+      y1Pct,
+      x2Pct,
+      y2Pct,
+      durationMs,
+      opts,
+    }),
+  groupKey: (groupId, key, opts) =>
+    ipcRenderer.invoke("group:key", { groupId, key, opts }),
+
+  // Group Macro
+  groupMacroPlay: (groupId, macroId, options, fanoutOpts) =>
+    ipcRenderer.invoke("group:macroPlay", {
+      groupId,
+      macroId,
+      options,
+      fanoutOpts,
+    }),
+  groupMacroStopGroup: (groupId) =>
+    ipcRenderer.invoke("group:macroStopGroup", { groupId }),
+  groupMacroStopDevice: (groupId, deviceId) =>
+    ipcRenderer.invoke("group:macroStopDevice", { groupId, deviceId }),
+  groupMacroSnapshot: (groupId) =>
+    ipcRenderer.invoke("group:macroSnapshot", { groupId }),
 });

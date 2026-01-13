@@ -16,6 +16,10 @@ const { runMacroOnDevice } = require("./macro/macroRunner");
 // ✅ V2 Hook
 const { ScrcpyHook } = require("./macro/scrcpyHook");
 
+// ✅ CORE 4
+const { GroupManager } = require("./controller/groupManager");
+const { GroupBroadcast } = require("./controller/groupBroadcast");
+
 if (require("electron-squirrel-startup")) {
   app.quit();
 }
@@ -27,7 +31,7 @@ let mainWindow = null;
 const recorder = new MacroRecorder();
 const hook = new ScrcpyHook();
 
-// running: deviceId -> { stop:boolean, token:number, startedAt:number, macroId:string }
+// running: deviceId -> { stop:boolean, token:number, startedAt:number, macroId:string, ... }
 const runningMacroByDevice = new Map();
 
 function sendMacroState(deviceId, state) {
@@ -126,10 +130,17 @@ const layoutConfig = {
   forceResizeOnApply: true,
 };
 
+// ===== CORE 4: Groups (persisted) =====
+let groupManager = new GroupManager([]);
+function getGroupsForSave() {
+  return groupManager.toJSON();
+}
+
 function getLayoutConfig() {
   return {
     ...layoutConfig,
     deviceOrder,
+    groups: getGroupsForSave(),
   };
 }
 
@@ -166,7 +177,12 @@ function setLayoutConfig(patch = {}) {
     setDeviceOrder(patch.deviceOrder);
   }
 
-  writeSettingsFile({ v: 1, ...getLayoutConfig() });
+  // allow patch.groups to overwrite groups
+  if (patch.groups != null && Array.isArray(patch.groups)) {
+    groupManager = new GroupManager(patch.groups);
+  }
+
+  writeSettingsFile({ v: 2, ...getLayoutConfig() });
 }
 
 // ===== slot manager =====
@@ -273,6 +289,25 @@ function rawToPct(raw, axisMax) {
   return Math.max(0, Math.min(1, val / axisMax));
 }
 
+// ======================
+// ✅ CORE 4: Broadcast Engine instance
+// ======================
+function loadMacroByIdFromStore(id) {
+  return loadMacro(app.getPath("userData"), id);
+}
+
+let groupBroadcast = null;
+function initGroupBroadcast() {
+  groupBroadcast = new GroupBroadcast({
+    registry,
+    getGroup: (groupId) => groupManager.get(groupId),
+    loadMacroById: loadMacroByIdFromStore,
+    runningMacroByDevice,
+    sendMacroState,
+    sendMacroProgress,
+  });
+}
+
 app.whenReady().then(() => {
   const saved = readSettingsFile();
   if (saved && typeof saved === "object") {
@@ -286,7 +321,14 @@ app.whenReady().then(() => {
     layoutConfig.forceResizeOnApply = !!(
       saved.forceResizeOnApply ?? layoutConfig.forceResizeOnApply
     );
+
+    // ✅ groups restore
+    if (Array.isArray(saved.groups)) {
+      groupManager = new GroupManager(saved.groups);
+    }
   }
+
+  initGroupBroadcast();
 
   mainWindow = createWindow();
   registry.startPolling(1500);
@@ -313,7 +355,7 @@ app.whenReady().then(() => {
   function ensureInOrder(deviceId) {
     if (!deviceOrder.includes(deviceId)) {
       deviceOrder.push(deviceId);
-      writeSettingsFile({ v: 1, ...getLayoutConfig() });
+      writeSettingsFile({ v: 2, ...getLayoutConfig() });
     }
   }
 
@@ -693,6 +735,7 @@ app.whenReady().then(() => {
       token: Date.now(), // run token
       startedAt: Date.now(),
       macroId,
+      source: "single",
     };
     runningMacroByDevice.set(deviceId, state);
 
@@ -731,8 +774,109 @@ app.whenReady().then(() => {
     return { ok: true };
   });
 
+  // ======================
+  // ✅ CORE 4: Group IPC
+  // ======================
+  function persistSettings() {
+    writeSettingsFile({ v: 2, ...getLayoutConfig() });
+  }
+
+  ipcMain.handle("group:list", async () => {
+    return groupManager.list();
+  });
+
+  ipcMain.handle("group:create", async (_, { id, name }) => {
+    const g = groupManager.create(id, name);
+    persistSettings();
+    return {
+      ok: true,
+      group: { id: g.id, name: g.name, devices: Array.from(g.devices) },
+    };
+  });
+
+  ipcMain.handle("group:rename", async (_, { id, name }) => {
+    const g = groupManager.rename(id, name);
+    persistSettings();
+    return {
+      ok: true,
+      group: { id: g.id, name: g.name, devices: Array.from(g.devices) },
+    };
+  });
+
+  ipcMain.handle("group:remove", async (_, { id }) => {
+    groupManager.remove(id);
+    persistSettings();
+    return { ok: true };
+  });
+
+  ipcMain.handle("group:addDevice", async (_, { groupId, deviceId }) => {
+    groupManager.addDevice(groupId, deviceId);
+    persistSettings();
+    return { ok: true };
+  });
+
+  ipcMain.handle("group:removeDevice", async (_, { groupId, deviceId }) => {
+    groupManager.removeDevice(groupId, deviceId);
+    persistSettings();
+    return { ok: true };
+  });
+
+  // ---- Broadcast Engine ----
+  ipcMain.handle("group:tapPct", async (_, { groupId, xPct, yPct, opts }) => {
+    return groupBroadcast.tapPct(
+      groupId,
+      Number(xPct),
+      Number(yPct),
+      opts || {}
+    );
+  });
+
+  ipcMain.handle(
+    "group:swipePct",
+    async (_, { groupId, x1Pct, y1Pct, x2Pct, y2Pct, durationMs, opts }) => {
+      return groupBroadcast.swipePct(
+        groupId,
+        Number(x1Pct),
+        Number(y1Pct),
+        Number(x2Pct),
+        Number(y2Pct),
+        Number(durationMs || 220),
+        opts || {}
+      );
+    }
+  );
+
+  ipcMain.handle("group:key", async (_, { groupId, key, opts }) => {
+    return groupBroadcast.key(groupId, key, opts || {});
+  });
+
+  // ---- Group Macro ----
+  ipcMain.handle(
+    "group:macroPlay",
+    async (_, { groupId, macroId, options, fanoutOpts }) => {
+      return groupBroadcast.playMacro(
+        groupId,
+        macroId,
+        options || {},
+        fanoutOpts || {}
+      );
+    }
+  );
+
+  ipcMain.handle("group:macroStopGroup", async (_, { groupId }) => {
+    return groupBroadcast.stopGroup(groupId);
+  });
+
+  ipcMain.handle("group:macroStopDevice", async (_, { groupId, deviceId }) => {
+    return groupBroadcast.stopDevice(groupId, deviceId);
+  });
+
+  ipcMain.handle("group:macroSnapshot", async (_, { groupId }) => {
+    return groupBroadcast.snapshot(groupId);
+  });
+
   app.on("before-quit", () => {
-    writeSettingsFile({ v: 1, ...getLayoutConfig() });
+    persistSettings();
   });
 
   app.on("activate", () => {

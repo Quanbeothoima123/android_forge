@@ -177,6 +177,44 @@
             <div class="muted small" style="margin-bottom:8px;">
                 Tip: Kéo thả để đổi thứ tự (StartAll/Apply layout sẽ theo đúng thứ tự này) — được lưu lại.
             </div>
+
+            <!-- ✅ CORE 4: Groups -->
+            <div class="sectionTitle">Groups (Core 4)</div>
+            <div class="inline small">
+                <select id="groupSel" class="w220"></select>
+                <button id="groupReloadBtn">Reload</button>
+            </div>
+
+            <div class="inline small" style="margin-top:8px;">
+                <input id="groupId" class="w120" placeholder="group id" />
+                <input id="groupName" class="w220" placeholder="group name" />
+                <button id="groupCreateBtn">Create</button>
+                <button id="groupRenameBtn">Rename</button>
+                <button id="groupRemoveBtn">Remove</button>
+            </div>
+
+            <div class="inline small" style="margin-top:8px;">
+                <button id="groupAddSelectedBtn">Add selected → group</button>
+                <button id="groupRemoveSelectedBtn">Remove selected ← group</button>
+            </div>
+
+            <div class="inline small" style="margin-top:8px;">
+                <span class="muted">Broadcast delay:</span>
+                <input id="gbBaseDelay" class="w90" value="90" />
+                <span class="muted">jitter:</span>
+                <input id="gbJitter" class="w90" value="160" />
+                <span class="muted">xy jitter:</span>
+                <input id="gbXyJitter" class="w90" value="0.004" />
+            </div>
+
+            <div class="inline small" style="margin-top:8px;">
+                <button id="gbHomeBtn">Broadcast HOME</button>
+                <button id="gbBackBtn">Broadcast BACK</button>
+                <button id="gbRecentsBtn">Broadcast RECENTS</button>
+            </div>
+
+            <div class="hr"></div>
+
             <div id="devices" class="muted">(loading...)</div>
         </div>
 
@@ -255,7 +293,6 @@
                 <button id="swipeBtn">Swipe</button>
             </div>
 
-            <!-- ✅ Macro UI -->
             <div class="hr"></div>
 
             <div class="sectionTitle">Macro</div>
@@ -268,7 +305,6 @@
                     (forge:&lt;deviceId&gt;)</span>
             </div>
 
-            <!-- ✅ macro runtime status -->
             <div id="macroStatus" class="muted small" style="margin-top:6px;">Macro: IDLE</div>
 
             <div class="inline small" style="margin-top:8px;">
@@ -299,6 +335,22 @@
                 <input id="macroLoop" class="w90" placeholder="loop" value="1" />
                 <button id="macroPlayBtn">Play on selected</button>
                 <button id="macroStopBtn">Stop</button>
+            </div>
+
+            <!-- ✅ CORE 4: Group Macro -->
+            <div class="sectionTitle">Group Macro (Core 4)</div>
+            <div class="inline small">
+                <button id="groupMacroPlayBtn">Play macro on group</button>
+                <button id="groupMacroStopGroupBtn">Stop group macro</button>
+
+                <span class="muted">Start base:</span>
+                <input id="gmBaseDelay" class="w90" value="120" />
+                <span class="muted">jitter:</span>
+                <input id="gmJitter" class="w90" value="280" />
+            </div>
+
+            <div class="inline small" style="margin-top:8px;">
+                <button id="groupMacroStopSelectedBtn">Stop selected device (in group run)</button>
             </div>
 
             <div class="inline small" style="margin-top:8px;">

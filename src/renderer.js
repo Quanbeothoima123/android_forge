@@ -31,6 +31,7 @@ let layoutState = {
   margin: 8,
   forceResizeOnApply: true,
   deviceOrder: [],
+  groups: [],
 };
 
 // Drag reorder local working list (device ids in UI order)
@@ -40,12 +41,14 @@ let uiOrder = [];
 let recordedSteps = [];
 const macroRuntimeByDevice = new Map(); // deviceId -> { running, macroId, stepIndex, stepCount, stepType }
 
+// ===== CORE 4: Groups =====
+let groups = [];
+let selectedGroupId = "";
+
 function setMacroUiEnabled(enabled) {
-  // disable play / record while running
   $("macroPlayBtn").disabled = !enabled;
   $("macroRecStartBtn").disabled = !enabled;
   $("macroSaveBtn").disabled = !enabled;
-  // Stop luôn enabled
   $("macroStopBtn").disabled = false;
 }
 
@@ -88,6 +91,10 @@ async function pullLayoutFromMain() {
 
     if (Array.isArray(layoutState.deviceOrder)) {
       uiOrder = [...layoutState.deviceOrder];
+    }
+
+    if (Array.isArray(layoutState.groups)) {
+      groups = [...layoutState.groups];
     }
   } catch {}
 }
@@ -291,6 +298,19 @@ function mustSelected() {
   return selectedDeviceId;
 }
 
+function mustGroupSelected() {
+  const gid = String(selectedGroupId || $("groupSel").value || "").trim();
+  if (!gid) throw new Error("Chưa chọn group");
+  return gid;
+}
+
+function readFanoutOpts() {
+  const baseDelayMs = Number($("gbBaseDelay").value || 90);
+  const jitterMs = Number($("gbJitter").value || 160);
+  const xyJitterPct = Number($("gbXyJitter").value || 0);
+  return { baseDelayMs, jitterMs, xyJitterPct };
+}
+
 async function act(name, fn) {
   try {
     await fn();
@@ -300,6 +320,108 @@ async function act(name, fn) {
     log(`${name} failed: ${e.message}`, true);
   }
 }
+
+// ===== CORE 4: Groups UI =====
+async function reloadGroups() {
+  try {
+    groups = await window.forgeAPI.groupList();
+  } catch {
+    groups = [];
+  }
+
+  const sel = $("groupSel");
+  sel.innerHTML = "";
+  for (const g of groups) {
+    const opt = document.createElement("option");
+    opt.value = g.id;
+    opt.textContent = `${g.name} (${g.id}) • ${g.devices?.length || 0} devices`;
+    sel.appendChild(opt);
+  }
+
+  if (!selectedGroupId && groups.length) selectedGroupId = groups[0].id;
+  if (selectedGroupId) sel.value = selectedGroupId;
+
+  sel.onchange = () => {
+    selectedGroupId = sel.value;
+  };
+}
+
+$("groupReloadBtn").addEventListener("click", () =>
+  act("group reload", reloadGroups)
+);
+
+$("groupCreateBtn").addEventListener("click", () =>
+  act("group create", async () => {
+    const id = String($("groupId").value || "").trim();
+    const name = String($("groupName").value || "").trim();
+    if (!id) throw new Error("group id required");
+    await window.forgeAPI.groupCreate(id, name || id);
+    selectedGroupId = id;
+    await reloadGroups();
+  })
+);
+
+$("groupRenameBtn").addEventListener("click", () =>
+  act("group rename", async () => {
+    const gid = mustGroupSelected();
+    const name = String($("groupName").value || "").trim();
+    if (!name) throw new Error("group name required");
+    await window.forgeAPI.groupRename(gid, name);
+    await reloadGroups();
+  })
+);
+
+$("groupRemoveBtn").addEventListener("click", () =>
+  act("group remove", async () => {
+    const gid = mustGroupSelected();
+    await window.forgeAPI.groupRemove(gid);
+    selectedGroupId = "";
+    await reloadGroups();
+  })
+);
+
+$("groupAddSelectedBtn").addEventListener("click", () =>
+  act("group add selected", async () => {
+    const gid = mustGroupSelected();
+    const did = mustSelected();
+    await window.forgeAPI.groupAddDevice(gid, did);
+    await reloadGroups();
+  })
+);
+
+$("groupRemoveSelectedBtn").addEventListener("click", () =>
+  act("group remove selected", async () => {
+    const gid = mustGroupSelected();
+    const did = mustSelected();
+    await window.forgeAPI.groupRemoveDevice(gid, did);
+    await reloadGroups();
+  })
+);
+
+// Broadcast keys
+$("gbHomeBtn").addEventListener("click", () =>
+  act("broadcast HOME", async () => {
+    const gid = mustGroupSelected();
+    const opts = readFanoutOpts();
+    await window.forgeAPI.groupKey(gid, "HOME", opts);
+  })
+);
+
+$("gbBackBtn").addEventListener("click", () =>
+  act("broadcast BACK", async () => {
+    const gid = mustGroupSelected();
+    const opts = readFanoutOpts();
+    await window.forgeAPI.groupKey(gid, "BACK", opts);
+  })
+);
+
+$("gbRecentsBtn").addEventListener("click", () =>
+  act("broadcast RECENTS", async () => {
+    const gid = mustGroupSelected();
+    const opts = readFanoutOpts();
+    await window.forgeAPI.groupKey(gid, "RECENTS", opts);
+  })
+);
 
 // ===== Layout controls =====
 ["scaleSel", "gridCols", "gridRows", "gridMargin", "forceResizeChk"].forEach(
@@ -557,7 +679,52 @@ $("macroStopBtn").addEventListener("click", () =>
   })
 );
 
-// ✅ listen macro state/progress from main
+// ✅ CORE 4: Group Macro buttons
+$("groupMacroPlayBtn").addEventListener("click", () =>
+  act("group macro play", async () => {
+    const gid = mustGroupSelected();
+    const macroId = $("macroList").value;
+    if (!macroId) throw new Error("Select a macro");
+
+    const loop = Number($("macroLoop").value || 1);
+    const speed = Number($("macroSpeed").value || 1.0);
+    const xyJitterPct = Number($("macroJitterXY").value || 0.0);
+    const delayJitterPct = Number($("macroJitterDelay").value || 0.0);
+
+    const gmBaseDelay = Number($("gmBaseDelay").value || 120);
+    const gmJitter = Number($("gmJitter").value || 280);
+
+    const r = await window.forgeAPI.groupMacroPlay(
+      gid,
+      macroId,
+      { loop, speed, xyJitterPct, delayJitterPct },
+      { baseDelayMs: gmBaseDelay, jitterMs: gmJitter }
+    );
+
+    log(
+      `Group macro started: group=${gid} macro=${macroId} started=${r?.started?.length || 0}`
+    );
+  })
+);
+
+$("groupMacroStopGroupBtn").addEventListener("click", () =>
+  act("group macro stop group", async () => {
+    const gid = mustGroupSelected();
+    const r = await window.forgeAPI.groupMacroStopGroup(gid);
+    log(`Stop group requested: stopped=${r?.stopped ?? "?"}`);
+  })
+);
+
+$("groupMacroStopSelectedBtn").addEventListener("click", () =>
+  act("group macro stop selected device", async () => {
+    const gid = mustGroupSelected();
+    const did = mustSelected();
+    const r = await window.forgeAPI.groupMacroStopDevice(gid, did);
+    log(`Stop device requested: ${did} stopped=${r?.stopped ? "YES" : "NO"}`);
+  })
+);
+
+// ✅ listen macro state/progress from main (single & group share channel)
 window.forgeAPI.onMacroState((p) => {
   const { deviceId, running, macroId } = p || {};
   if (!deviceId) return;
@@ -638,8 +805,9 @@ window.forgeAPI.onScrcpyClosed(({ deviceId, code, signal }) => {
 });
 
 (async function boot() {
-  log("Control Panel loaded. Core 3 macro enabled (V2 hook).");
+  log("Control Panel loaded. Core 3 macro enabled (V2 hook) + Core 4 groups.");
   await pullLayoutFromMain();
+  await reloadGroups();
   await refreshUI();
   await reloadMacroList();
   setInterval(refreshUI, 1500);

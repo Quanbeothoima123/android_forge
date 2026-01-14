@@ -1,5 +1,6 @@
 // src/controller/adb.js
 const { spawn } = require("child_process");
+const logger = require("./logger");
 
 /**
  * Global ADB concurrency limiter to reduce "adb freeze" when controlling 5-10 devices.
@@ -40,6 +41,9 @@ function _enqueueJob(jobFn) {
 }
 
 function runAdb(args, timeoutMs = 8000) {
+  const startedAt = Date.now();
+  const cmdStr = `adb ${args.join(" ")}`;
+
   return _enqueueJob(() => {
     return new Promise((resolve, reject) => {
       const p = spawn("adb", args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -51,7 +55,9 @@ function runAdb(args, timeoutMs = 8000) {
         try {
           p.kill("SIGKILL");
         } catch {}
-        reject(new Error(`adb timeout: adb ${args.join(" ")}`));
+        const durMs = Date.now() - startedAt;
+        logger.error("adb:timeout", { cmd: cmdStr, timeoutMs, durMs });
+        reject(new Error(`adb timeout: ${cmdStr}`));
       }, timeoutMs);
 
       p.stdout.on("data", (d) => (out += d.toString("utf8")));
@@ -59,12 +65,33 @@ function runAdb(args, timeoutMs = 8000) {
 
       p.on("close", (code) => {
         clearTimeout(timer);
+        const durMs = Date.now() - startedAt;
+
+        // slow adb warning (useful for long-run)
+        if (durMs >= 2500) {
+          logger.warn("adb:slow", { cmd: cmdStr, durMs, code });
+        }
+
         if (code === 0) return resolve(out.trim());
-        reject(new Error(`adb failed (code ${code}): ${err.trim()}`));
+
+        const e = new Error(`adb failed (code ${code}): ${err.trim()}`);
+        logger.error("adb:failed", {
+          cmd: cmdStr,
+          durMs,
+          code,
+          stderr: (err || "").trim().slice(0, 2000),
+        });
+        reject(e);
       });
 
       p.on("error", (e) => {
         clearTimeout(timer);
+        const durMs = Date.now() - startedAt;
+        logger.error("adb:spawn_error", {
+          cmd: cmdStr,
+          durMs,
+          err: e?.message || String(e),
+        });
         reject(e);
       });
     });

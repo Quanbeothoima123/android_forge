@@ -1,6 +1,7 @@
 // src/controller/scrcpyController.js
 const { spawn } = require("child_process");
 const { EventEmitter } = require("events");
+const logger = require("./logger");
 
 function toPsEncodedCommand(psScript) {
   // PowerShell -EncodedCommand expects UTF-16LE base64
@@ -62,21 +63,25 @@ class ScrcpyController extends EventEmitter {
         String(bitRate),
       ];
 
-      // perf scale: limit decoded video size
       if (maxSize && maxSize >= 120)
         args.push("-m", String(Math.round(maxSize)));
 
-      // initial window size (still user-resizable)
-      if (Number.isFinite(targetW) && targetW >= 120) {
+      if (Number.isFinite(targetW) && targetW >= 120)
         args.push("--window-width", String(Math.round(targetW)));
-      }
-      if (Number.isFinite(targetH) && targetH >= 200) {
+      if (Number.isFinite(targetH) && targetH >= 200)
         args.push("--window-height", String(Math.round(targetH)));
-      }
 
       if (Number.isFinite(opts.port)) args.push("--port", String(opts.port));
       if (borderless) args.push("--window-borderless");
       if (alwaysOnTop) args.push("--always-on-top");
+
+      logger.audit("scrcpy:start", {
+        deviceId,
+        title,
+        port: opts.port ?? null,
+        maxFps,
+        bitRate,
+      });
 
       const proc = spawn("scrcpy", args, {
         stdio: ["ignore", "ignore", "pipe"],
@@ -84,17 +89,22 @@ class ScrcpyController extends EventEmitter {
       });
 
       proc.on("error", (err) => {
-        console.error("[scrcpy spawn error]", err);
+        logger.error("scrcpy:spawn_error", {
+          deviceId,
+          err: err?.message || String(err),
+        });
         this.stop(deviceId).catch(() => {});
       });
 
       proc.stderr.on("data", (d) => {
         const s = d.toString("utf8").trim();
-        if (s) console.log("[scrcpy]", s);
+        if (s)
+          logger.info("scrcpy:stderr", { deviceId, line: s.slice(0, 600) });
       });
 
       proc.on("close", (code, signal) => {
         this.procs.delete(deviceId);
+        logger.audit("scrcpy:closed", { deviceId, code, signal });
         this.emit("closed", { deviceId, code, signal });
       });
 
@@ -133,9 +143,11 @@ class ScrcpyController extends EventEmitter {
           : 15000,
       };
 
-      // Important: do not await; but PS itself retries inside so it should land correctly
       this._applyWindowRulesByTitle(title, rules).catch((e) => {
-        console.log("[scrcpy window rules] failed:", e.message);
+        logger.warn("scrcpy:window_rules_failed", {
+          deviceId,
+          msg: e?.message || String(e),
+        });
       });
 
       return true;
@@ -151,6 +163,8 @@ class ScrcpyController extends EventEmitter {
     try {
       const s = this.procs.get(deviceId);
       if (!s) return;
+
+      logger.audit("scrcpy:stop", { deviceId });
 
       this.procs.delete(deviceId);
 
@@ -183,6 +197,13 @@ class ScrcpyController extends EventEmitter {
 
   async applyLayout(items, layout, cell, options = {}) {
     if (!Array.isArray(items) || items.length === 0) return true;
+
+    logger.audit("scrcpy:applyLayout", {
+      count: items.length,
+      layout: layout || {},
+      cell: cell || {},
+      options: options || {},
+    });
 
     const mode = layout?.mode || "grid";
     const cols = Number.isFinite(layout?.cols) ? Number(layout.cols) : null;
@@ -221,7 +242,10 @@ class ScrcpyController extends EventEmitter {
       try {
         await this._applyWindowRulesByTitle(title, rules);
       } catch (e) {
-        console.log("[applyLayout] failed:", title, e.message);
+        logger.warn("scrcpy:applyLayout_failed", {
+          title,
+          msg: e?.message || String(e),
+        });
       }
 
       await sleep(35);
@@ -230,6 +254,7 @@ class ScrcpyController extends EventEmitter {
     return true;
   }
 
+  // (phần _applyWindowRulesByTitle giữ nguyên 100% logic của bạn)
   _applyWindowRulesByTitle(title, rules) {
     const width = Number(rules.width || 360);
     const height = Number(rules.height || 800);
@@ -249,8 +274,6 @@ class ScrcpyController extends EventEmitter {
     const forceSize = !!rules.forceSize;
     const timeoutMs = Number(rules.timeoutMs || 15000);
 
-    // ✅ FIX: Retry apply move/resize several times after hwnd found
-    // because scrcpy window may re-center itself right after spawn.
     const ps = `
 $ProgressPreference = 'SilentlyContinue'
 
@@ -361,7 +384,6 @@ function ComputeXY {
 $xy = ComputeXY $wa $w $h $m $layoutMode $slotIndex $colsFixed $rowsFixed $corner
 $X = $xy[0]; $Y = $xy[1]
 
-# retry apply (important for scrcpy initial center/resize)
 for ($i=0; $i -lt 10; $i++) {
   if ($forceSize) {
     $flags = [Win32]::SWP_SHOWWINDOW
@@ -401,11 +423,12 @@ exit 0
 
       p.stderr.on("data", (d) => {
         const s = d.toString("utf8").trim();
-        if (s && !s.includes("CLIXML")) console.log("[ps err]", s);
+        if (s && !s.includes("CLIXML"))
+          logger.warn("ps:stderr", { title, line: s.slice(0, 600) });
       });
       p.stdout.on("data", (d) => {
         const s = d.toString("utf8").trim();
-        if (s) console.log("[ps out]", s);
+        if (s) logger.info("ps:stdout", { title, line: s.slice(0, 600) });
       });
 
       p.on("close", (code) => {

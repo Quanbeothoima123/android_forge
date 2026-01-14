@@ -4,6 +4,12 @@ const { contextBridge, ipcRenderer } = require("electron");
 contextBridge.exposeInMainWorld("forgeAPI", {
   listDevices: () => ipcRenderer.invoke("devices:list"),
 
+  // logs
+  logTail: (maxLines) => ipcRenderer.invoke("log:tail", { maxLines }),
+  onLogLine: (cb) => {
+    ipcRenderer.on("log:line", (_, line) => cb(line));
+  },
+
   // ✅ device alias
   deviceAliasSet: (deviceId, alias) =>
     ipcRenderer.invoke("device:aliasSet", { deviceId, alias }),

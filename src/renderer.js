@@ -3,7 +3,7 @@ function $(id) {
   return document.getElementById(id);
 }
 
-function log(msg, isError = false) {
+function logLocal(msg, isError = false) {
   const el = $("log");
   const t = new Date().toLocaleTimeString();
   el.innerHTML =
@@ -20,9 +20,6 @@ function fmtRes(d) {
 let selectedDeviceId = "";
 const devicesById = new Map();
 
-// ===== AutoStart anti-spam =====
-const autoStartPending = new Set();
-
 // ===== Layout state (from main) =====
 let layoutState = {
   scalePct: 50,
@@ -35,26 +32,28 @@ let layoutState = {
   broadcastDefaults: { baseDelayMs: 90, jitterMs: 160, xyJitterPct: 0.004 },
   groupMacroDefaults: { baseDelayMs: 120, jitterMs: 280 },
   deviceAliases: {},
+
+  // ✅ Core 5
+  autoStartEnabled: false,
+  autoWakeOnRecover: true,
 };
 
-// Drag reorder local working list (device ids in UI order)
+// Drag reorder local working list
 let uiOrder = [];
 
 // ===== Macro state =====
 let recordedSteps = [];
 const macroRuntimeByDevice = new Map();
-
-// ✅ NEW: track running->stopped transitions for logging "done"
-const macroPrevRunningByDevice = new Map(); // deviceId -> boolean
+const macroPrevRunningByDevice = new Map();
 
 // ===== Groups =====
 let groups = [];
 let selectedGroupId = "";
 
-// ✅ Alias edit guard / draft
-let aliasDraftByDevice = new Map(); // deviceId -> current typed text
-let aliasDirtyDeviceId = ""; // which device is being edited
-let lastSelectedDeviceIdForAlias = ""; // to detect device change
+// Alias edit guard / draft
+let aliasDraftByDevice = new Map();
+let aliasDirtyDeviceId = "";
+let lastSelectedDeviceIdForAlias = "";
 
 function setMacroUiEnabled(enabled) {
   $("macroPlayBtn").disabled = !enabled;
@@ -100,24 +99,21 @@ async function pullLayoutFromMain() {
     $("gridMargin").value = String(layoutState.margin ?? 8);
     $("forceResizeChk").checked = !!layoutState.forceResizeOnApply;
 
-    // ✅ load persisted broadcast defaults to UI
+    // ✅ Core 5: autoStart flag from main
+    $("autoStartChk").checked = !!layoutState.autoStartEnabled;
+
     const bd = layoutState.broadcastDefaults || {};
     if (bd.baseDelayMs != null) $("gbBaseDelay").value = String(bd.baseDelayMs);
     if (bd.jitterMs != null) $("gbJitter").value = String(bd.jitterMs);
     if (bd.xyJitterPct != null) $("gbXyJitter").value = String(bd.xyJitterPct);
 
-    // ✅ load persisted group macro defaults to UI
     const gd = layoutState.groupMacroDefaults || {};
     if (gd.baseDelayMs != null) $("gmBaseDelay").value = String(gd.baseDelayMs);
     if (gd.jitterMs != null) $("gmJitter").value = String(gd.jitterMs);
 
-    if (Array.isArray(layoutState.deviceOrder)) {
+    if (Array.isArray(layoutState.deviceOrder))
       uiOrder = [...layoutState.deviceOrder];
-    }
-
-    if (Array.isArray(layoutState.groups)) {
-      groups = [...layoutState.groups];
-    }
+    if (Array.isArray(layoutState.groups)) groups = [...layoutState.groups];
 
     if (
       layoutState.deviceAliases &&
@@ -134,7 +130,8 @@ function readLayoutFromUI() {
   const rows = Number($("gridRows").value || 0);
   const margin = Number($("gridMargin").value || 8);
   const forceResizeOnApply = !!$("forceResizeChk").checked;
-  return { scalePct, cols, rows, margin, forceResizeOnApply };
+  const autoStartEnabled = !!$("autoStartChk").checked;
+  return { scalePct, cols, rows, margin, forceResizeOnApply, autoStartEnabled };
 }
 
 async function pushLayoutToMain(extra = {}) {
@@ -147,9 +144,8 @@ async function pushLayoutToMain(extra = {}) {
 
 function ensureInUiOrder(devices) {
   const existing = new Set(uiOrder);
-  for (const d of devices) {
+  for (const d of devices)
     if (!existing.has(d.deviceId)) uiOrder.push(d.deviceId);
-  }
   const alive = new Set(devices.map((d) => d.deviceId));
   uiOrder = uiOrder.filter((id) => alive.has(id));
 }
@@ -197,6 +193,9 @@ function renderDevices(devices) {
     const title = getDisplayName(d);
     const sub = d.model && d.alias ? `Model: ${d.model}` : "";
 
+    const onlineMs = Number(d.totalOnlineMs || 0);
+    const onlineMin = Math.floor(onlineMs / 60000);
+
     div.innerHTML = `
       <div style="display:flex; justify-content:space-between; gap:8px; align-items:center;">
         <div style="min-width:0;">
@@ -209,6 +208,9 @@ function renderDevices(devices) {
           </div>
           <div class="kv muted">
             Android ${d.androidVersion || "?"} • ${fmtRes(d)} • ${d.state}
+          </div>
+          <div class="kv muted small">
+            Online total: ~${onlineMin}m • ADB errors: ${d.adbErrorCount || 0}
           </div>
         </div>
         <div style="display:flex; flex-direction:column; gap:6px; align-items:flex-end;">
@@ -353,9 +355,9 @@ async function updateSelectedInfo() {
     <div class="muted mono">${selectedDeviceId}</div>
     <div class="muted">State: ${d.state} • Android ${d.androidVersion || "?"} • Res: ${fmtRes(d)} • AgentReady: ${d.agentReady ? "YES" : "NO"}</div>
     ${d.model ? `<div class="muted small">Model: ${d.model}</div>` : ""}
+    <div class="muted small">ADB errors: ${d.adbErrorCount || 0} ${d.lastAdbErrorMsg ? `• last: ${d.lastAdbErrorMsg}` : ""}</div>
   `;
 
-  // ✅ FIX: chỉ update aliasInput.value nếu user không đang gõ
   const deviceChanged = lastSelectedDeviceIdForAlias !== selectedDeviceId;
   lastSelectedDeviceIdForAlias = selectedDeviceId;
 
@@ -363,20 +365,16 @@ async function updateSelectedInfo() {
     const isFocused = document.activeElement === aliasInput;
     const isDirtyThisDevice = aliasDirtyDeviceId === selectedDeviceId;
 
-    // nguồn alias chuẩn từ device snapshot
     const stableAlias = String(d.alias || "").trim();
 
-    // nếu device đổi -> ưu tiên show alias đúng ngay
     if (deviceChanged) {
-      aliasDirtyDeviceId = ""; // reset dirty when switching device
+      aliasDirtyDeviceId = "";
       const draft = aliasDraftByDevice.get(selectedDeviceId);
       aliasInput.value = draft != null ? draft : stableAlias;
     } else {
-      // same device
       if (isFocused || isDirtyThisDevice) {
         // user đang gõ -> KHÔNG overwrite
       } else {
-        // không gõ -> sync theo stable
         aliasInput.value = stableAlias;
       }
     }
@@ -441,14 +439,14 @@ function readGroupMacroDefaults() {
 async function act(name, fn) {
   try {
     await fn();
-    log(name);
+    logLocal(name);
     refreshUI();
   } catch (e) {
-    log(`${name} failed: ${e.message}`, true);
+    logLocal(`${name} failed: ${e.message}`, true);
   }
 }
 
-// ✅ auto-save broadcast settings (persist)
+// auto-save broadcast settings (persist)
 async function persistBroadcastDefaults() {
   await pushLayoutToMain({ broadcastDefaults: readFanoutOpts() });
 }
@@ -536,25 +534,29 @@ $("groupRemoveSelectedBtn").addEventListener("click", () =>
   })
 );
 
-// ✅ broadcast input changes => persist
+// broadcast input changes => persist
 ["gbBaseDelay", "gbJitter", "gbXyJitter"].forEach((id) => {
   $(id).addEventListener("change", () => persistBroadcastDefaults());
   $(id).addEventListener("input", () => persistBroadcastDefaults());
 });
 
-// ✅ group macro defaults persist
+// group macro defaults persist
 ["gmBaseDelay", "gmJitter"].forEach((id) => {
   $(id).addEventListener("change", () => persistGroupMacroDefaults());
   $(id).addEventListener("input", () => persistGroupMacroDefaults());
 });
 
-// ✅ Alias typing hooks (FIX core)
+// ✅ Core 5: AutoStart checkbox => persist to main
+$("autoStartChk").addEventListener("change", () =>
+  pushLayoutToMain({ autoStartEnabled: !!$("autoStartChk").checked })
+);
+
+// Alias hooks
 (function initAliasHooks() {
   const inp = $("aliasInput");
   if (!inp) return;
 
   inp.addEventListener("focus", () => {
-    // mark dirty for current device if user intends to edit
     if (selectedDeviceId) aliasDirtyDeviceId = selectedDeviceId;
   });
 
@@ -563,14 +565,9 @@ $("groupRemoveSelectedBtn").addEventListener("click", () =>
     aliasDirtyDeviceId = selectedDeviceId;
     aliasDraftByDevice.set(selectedDeviceId, String(inp.value || ""));
   });
-
-  inp.addEventListener("blur", () => {
-    // keep draft, but allow UI to sync later if not dirty
-    // (dirty flag remains until save/clear, so it won't overwrite)
-  });
 })();
 
-// ===== Alias save/clear =====
+// Alias save/clear
 $("aliasSaveBtn").addEventListener("click", () =>
   act("save alias", async () => {
     const did = selectedDeviceId;
@@ -578,15 +575,13 @@ $("aliasSaveBtn").addEventListener("click", () =>
     const alias = String($("aliasInput").value || "").trim();
     const r = await window.forgeAPI.deviceAliasSet(did, alias);
 
-    // local cache
     if (alias) layoutState.deviceAliases[did] = alias;
     else delete layoutState.deviceAliases[did];
 
-    // ✅ clear dirty/draft so refresh can sync stable
     aliasDirtyDeviceId = "";
     aliasDraftByDevice.delete(did);
 
-    log(`Alias saved: ${did} = "${r.alias || ""}"`);
+    logLocal(`Alias saved: ${did} = "${r.alias || ""}"`);
     renderGroupDevicesPanel();
   })
 );
@@ -599,16 +594,15 @@ $("aliasClearBtn").addEventListener("click", () =>
     delete layoutState.deviceAliases[did];
     $("aliasInput").value = "";
 
-    // ✅ clear dirty/draft
     aliasDirtyDeviceId = "";
     aliasDraftByDevice.delete(did);
 
-    log(`Alias cleared: ${did}`);
+    logLocal(`Alias cleared: ${did}`);
     renderGroupDevicesPanel();
   })
 );
 
-// ===== Group Broadcast buttons =====
+// Group Broadcast buttons
 $("gbHomeBtn").addEventListener("click", () =>
   act("broadcast HOME", async () => {
     const gid = mustGroupSelected();
@@ -691,7 +685,7 @@ $("gbSwipeRightBtn").addEventListener("click", () =>
   })
 );
 
-// ===== Layout controls =====
+// Layout controls
 ["scaleSel", "gridCols", "gridRows", "gridMargin", "forceResizeChk"].forEach(
   (id) => {
     $(id).addEventListener("change", () =>
@@ -708,7 +702,7 @@ $("applyLayoutBtn").addEventListener("click", () =>
     await pushLayoutToMain({ deviceOrder: uiOrder });
     const forceResize = !!$("forceResizeChk").checked;
     const r = await window.forgeAPI.scrcpyApplyLayout({ forceResize });
-    log(
+    logLocal(
       `Apply layout: ${r?.count ?? "?"} windows (forceResize=${r?.forceResize ?? forceResize})`
     );
   })
@@ -718,19 +712,18 @@ $("startAllBtn").addEventListener("click", async () => {
   try {
     await pushLayoutToMain({ deviceOrder: uiOrder });
     const ids = await window.forgeAPI.scrcpyStartAll();
-    log(`StartAll: ${ids.length} devices`);
+    logLocal(`StartAll: ${ids.length} devices`);
   } catch (e) {
-    log(e.message, true);
+    logLocal(e.message, true);
   }
 });
 
 $("stopAllBtn").addEventListener("click", async () => {
   try {
     await window.forgeAPI.scrcpyStopAll();
-    autoStartPending.clear();
-    log("StopAll done");
+    logLocal("StopAll done");
   } catch (e) {
-    log(e.message, true);
+    logLocal(e.message, true);
   }
 });
 
@@ -746,11 +739,10 @@ $("stopBtn").addEventListener("click", () =>
   act("scrcpy stop", async () => {
     const id = mustSelected();
     await window.forgeAPI.scrcpyStop(id);
-    autoStartPending.delete(id);
   })
 );
 
-// ===== Single device quick controls =====
+// Single device quick controls
 $("wakeBtn").addEventListener("click", () =>
   act("wake", async () => {
     const id = mustSelected();
@@ -842,7 +834,7 @@ $("swipeBtn").addEventListener("click", () =>
   })
 );
 
-// ===== Macro UI =====
+// Macro UI
 async function reloadMacroList() {
   const list = await window.forgeAPI.listMacros();
   const sel = $("macroList");
@@ -863,13 +855,12 @@ $("macroReloadBtn").addEventListener("click", () =>
 $("macroRecStartBtn").addEventListener("click", () =>
   act("macro record start", async () => {
     const id = mustSelected();
-
     const st = macroRuntimeByDevice.get(id);
     if (st?.running) throw new Error("Macro is running. Stop first.");
 
     await window.forgeAPI.macroRecordStart(id);
     recordedSteps = [];
-    log("Recording started (V2: click/drag trực tiếp trên scrcpy window)");
+    logLocal("Recording started (V2: click/drag trực tiếp trên scrcpy window)");
   })
 );
 
@@ -877,7 +868,7 @@ $("macroRecStopBtn").addEventListener("click", () =>
   act("macro record stop", async () => {
     const r = await window.forgeAPI.macroRecordStop();
     recordedSteps = r.steps || [];
-    log(`Recording stopped. steps=${recordedSteps.length}`);
+    logLocal(`Recording stopped. steps=${recordedSteps.length}`);
   })
 );
 
@@ -885,7 +876,7 @@ $("macroAddTextBtn").addEventListener("click", () =>
   act("macro add text", async () => {
     const text = $("macroText").value || "";
     await window.forgeAPI.macroRecordAddText(text);
-    log(`TEXT step added: "${text}"`);
+    logLocal(`TEXT step added: "${text}"`);
   })
 );
 
@@ -893,7 +884,7 @@ $("macroAddKeyBtn").addEventListener("click", () =>
   act("macro add key", async () => {
     const key = $("macroKeySel").value;
     await window.forgeAPI.macroRecordAddKey(key);
-    log(`KEY step added: ${key}`);
+    logLocal(`KEY step added: ${key}`);
   })
 );
 
@@ -901,7 +892,7 @@ $("macroAddWaitBtn").addEventListener("click", () =>
   act("macro add wait", async () => {
     const ms = Number($("macroWaitMs").value || 0);
     await window.forgeAPI.macroRecordAddWait(ms);
-    log(`WAIT step added: ${ms}ms`);
+    logLocal(`WAIT step added: ${ms}ms`);
   })
 );
 
@@ -912,7 +903,7 @@ $("macroSaveBtn").addEventListener("click", () =>
     if (!recordedSteps.length)
       throw new Error("No recorded steps. Stop Record first.");
     await window.forgeAPI.macroSave(name, desc, recordedSteps);
-    log(`Saved macro: ${name}`);
+    logLocal(`Saved macro: ${name}`);
     await reloadMacroList();
   })
 );
@@ -920,7 +911,6 @@ $("macroSaveBtn").addEventListener("click", () =>
 $("macroPlayBtn").addEventListener("click", () =>
   act("macro play", async () => {
     const id = mustSelected();
-
     const st = macroRuntimeByDevice.get(id);
     if (st?.running)
       throw new Error("Macro is already running on this device.");
@@ -947,8 +937,7 @@ $("macroPlayBtn").addEventListener("click", () =>
       xyJitterPct,
       delayJitterPct,
     });
-
-    log(`Play macro ${macroId} on ${id}`);
+    logLocal(`Play macro ${macroId} on ${id}`);
   })
 );
 
@@ -956,7 +945,7 @@ $("macroStopBtn").addEventListener("click", () =>
   act("macro stop", async () => {
     const id = mustSelected();
     await window.forgeAPI.macroStop(id);
-    log("Stop requested");
+    logLocal("Stop requested");
   })
 );
 
@@ -975,7 +964,6 @@ $("groupMacroPlayBtn").addEventListener("click", () =>
     const gmBaseDelay = Number($("gmBaseDelay").value || 120);
     const gmJitter = Number($("gmJitter").value || 280);
 
-    // persist defaults
     await persistGroupMacroDefaults();
 
     const r = await window.forgeAPI.groupMacroPlay(
@@ -985,7 +973,7 @@ $("groupMacroPlayBtn").addEventListener("click", () =>
       { baseDelayMs: gmBaseDelay, jitterMs: gmJitter }
     );
 
-    log(
+    logLocal(
       `Group macro started: group=${gid} macro=${macroId} started=${r?.started?.length || 0}`
     );
   })
@@ -995,7 +983,7 @@ $("groupMacroStopGroupBtn").addEventListener("click", () =>
   act("group macro stop group", async () => {
     const gid = mustGroupSelected();
     const r = await window.forgeAPI.groupMacroStopGroup(gid);
-    log(`Stop group requested: stopped=${r?.stopped ?? "?"}`);
+    logLocal(`Stop group requested: stopped=${r?.stopped ?? "?"}`);
   })
 );
 
@@ -1004,7 +992,9 @@ $("groupMacroStopSelectedBtn").addEventListener("click", () =>
     const gid = mustGroupSelected();
     const did = mustSelected();
     const r = await window.forgeAPI.groupMacroStopDevice(gid, did);
-    log(`Stop device requested: ${did} stopped=${r?.stopped ? "YES" : "NO"}`);
+    logLocal(
+      `Stop device requested: ${did} stopped=${r?.stopped ? "YES" : "NO"}`
+    );
   })
 );
 
@@ -1016,11 +1006,10 @@ window.forgeAPI.onMacroState((p) => {
   const prevRunning = !!macroPrevRunningByDevice.get(deviceId);
   const nextRunning = !!running;
 
-  // ✅ LOG: when a macro finishes/stops on any device (single or group)
   if (prevRunning && !nextRunning) {
     const d = devicesById.get(deviceId);
     const name = getDisplayName(d || { deviceId });
-    log(`Macro finished/stopped on ${name} (${deviceId})`);
+    logLocal(`Macro finished/stopped on ${name} (${deviceId})`);
   }
 
   macroPrevRunningByDevice.set(deviceId, nextRunning);
@@ -1049,18 +1038,34 @@ window.forgeAPI.onMacroProgress((p) => {
     stepCount,
     stepType,
   });
-
   if (deviceId === selectedDeviceId) renderMacroStatus(deviceId);
 });
 
-// ===== refresh loop =====
+// scrcpy closed
+window.forgeAPI.onScrcpyClosed(({ deviceId, code, signal }) => {
+  logLocal(
+    `scrcpy closed: ${deviceId} (code=${code ?? "?"}, signal=${signal ?? "?"})`,
+    true
+  );
+  refreshUI();
+});
+
+// ✅ Core 5: receive logs from main (file-backed)
+window.forgeAPI.onLogLine((line) => {
+  // already has timestamp + level
+  const isErr = String(line).includes(" ERROR ");
+  const el = $("log");
+  el.innerHTML =
+    `<div class="${isErr ? "err" : ""}">${line}</div>` + el.innerHTML;
+});
+
+// refresh loop
 async function refreshUI() {
   const devices = await window.forgeAPI.listDevices();
 
   devicesById.clear();
   for (const d of devices) {
     devicesById.set(d.deviceId, d);
-    // keep local alias cache
     if (d.alias) layoutState.deviceAliases[d.deviceId] = d.alias;
   }
 
@@ -1072,45 +1077,24 @@ async function refreshUI() {
   }
 
   renderDevices(devices);
-
-  // group panel updates with latest ONLINE/OFFLINE + alias
   renderGroupDevicesPanel();
-
-  if ($("autoStartChk").checked) {
-    for (const d of devices) {
-      if (d.state !== "ONLINE") continue;
-      if (autoStartPending.has(d.deviceId)) continue;
-
-      try {
-        const running = await window.forgeAPI.scrcpyIsRunning(d.deviceId);
-        if (!running) {
-          autoStartPending.add(d.deviceId);
-          await pushLayoutToMain({ deviceOrder: uiOrder });
-          await window.forgeAPI.scrcpyStart(d.deviceId);
-        }
-      } catch {
-      } finally {
-        setTimeout(() => autoStartPending.delete(d.deviceId), 1200);
-      }
-    }
-  }
-
   await updateSelectedInfo();
 }
 
-window.forgeAPI.onScrcpyClosed(({ deviceId, code, signal }) => {
-  autoStartPending.delete(deviceId);
-  log(
-    `scrcpy closed: ${deviceId} (code=${code ?? "?"}, signal=${signal ?? "?"})`,
-    true
-  );
-  refreshUI();
-});
-
 (async function boot() {
-  log(
-    "Control Panel loaded. Alias input now guarded (won't be overwritten while typing)."
-  );
+  // preload last log tail
+  try {
+    const lines = await window.forgeAPI.logTail(80);
+    for (const l of lines) {
+      const isErr = String(l).includes(" ERROR ");
+      const el = $("log");
+      el.innerHTML =
+        `<div class="${isErr ? "err" : ""}">${l}</div>` + el.innerHTML;
+    }
+  } catch {}
+
+  logLocal("Control Panel loaded. (Core5 logging + autoStart moved to main)");
+
   await pullLayoutFromMain();
   await reloadGroups();
   await refreshUI();

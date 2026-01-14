@@ -20,6 +20,9 @@ const { ScrcpyHook } = require("./macro/scrcpyHook");
 const { GroupManager } = require("./controller/groupManager");
 const { GroupBroadcast } = require("./controller/groupBroadcast");
 
+// ✅ Core 5: Logger
+const { Logger } = require("./controller/logger");
+
 if (require("electron-squirrel-startup")) {
   app.quit();
 }
@@ -34,17 +37,14 @@ const hook = new ScrcpyHook();
 // running: deviceId -> { stop:boolean, token:number, ... }
 const runningMacroByDevice = new Map();
 
-function sendMacroState(deviceId, state) {
+function safeSend(channel, payload) {
   if (!mainWindow || mainWindow.isDestroyed()) return;
-  mainWindow.webContents.send("macro:state", { deviceId, ...state });
+  try {
+    mainWindow.webContents.send(channel, payload);
+  } catch {}
 }
 
-function sendMacroProgress(deviceId, payload) {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  mainWindow.webContents.send("macro:progress", { deviceId, ...payload });
-}
-
-// ===== settings persistence =====
+// ========= settings persistence =========
 function settingsPath() {
   return path.join(app.getPath("userData"), "settings.json");
 }
@@ -94,7 +94,7 @@ function normalizeScalePct(pct) {
   return best;
 }
 
-// ===== Device order =====
+// ========= Device order =========
 let deviceOrder = [];
 function setDeviceOrder(newOrder) {
   if (!Array.isArray(newOrder)) return;
@@ -121,16 +121,22 @@ function sortDevicesByOrder(devices) {
   });
 }
 
-// ===== layout config =====
+// ========= layout config =========
 const layoutConfig = {
   scalePct: 50,
   cols: 4,
   rows: 0,
   margin: 8,
   forceResizeOnApply: true,
+
+  // ✅ Core 5: move AutoStart to MAIN (reliable long-run)
+  autoStartEnabled: false,
+
+  // ✅ Core 5: wake screen after auto recover (default true)
+  autoWakeOnRecover: true,
 };
 
-// ✅ persist: broadcast defaults + group macro defaults + device aliases
+// persist: broadcast defaults + group macro defaults + device aliases
 let broadcastDefaults = {
   baseDelayMs: 90,
   jitterMs: 160,
@@ -145,7 +151,7 @@ let groupMacroDefaults = {
 // deviceId -> alias
 let deviceAliases = {}; // { [deviceId]: "My Name" }
 
-// ===== Groups (persisted) =====
+// ========= Groups (persisted) =========
 let groupManager = new GroupManager([]);
 
 function getGroupsForSave() {
@@ -164,7 +170,7 @@ function getLayoutConfig() {
 }
 
 function persistSettings() {
-  writeSettingsFile({ v: 3, ...getLayoutConfig() });
+  writeSettingsFile({ v: 4, ...getLayoutConfig() });
 }
 
 function setLayoutConfig(patch = {}) {
@@ -196,6 +202,14 @@ function setLayoutConfig(patch = {}) {
     layoutConfig.forceResizeOnApply = !!patch.forceResizeOnApply;
   }
 
+  if (patch.autoStartEnabled != null) {
+    layoutConfig.autoStartEnabled = !!patch.autoStartEnabled;
+  }
+
+  if (patch.autoWakeOnRecover != null) {
+    layoutConfig.autoWakeOnRecover = !!patch.autoWakeOnRecover;
+  }
+
   if (patch.deviceOrder != null) {
     setDeviceOrder(patch.deviceOrder);
   }
@@ -204,7 +218,6 @@ function setLayoutConfig(patch = {}) {
     groupManager = new GroupManager(patch.groups);
   }
 
-  // ✅ broadcast defaults (persist)
   if (patch.broadcastDefaults && typeof patch.broadcastDefaults === "object") {
     const bd = patch.broadcastDefaults;
     if (bd.baseDelayMs != null)
@@ -215,7 +228,6 @@ function setLayoutConfig(patch = {}) {
       broadcastDefaults.xyJitterPct = Math.max(0, Number(bd.xyJitterPct) || 0);
   }
 
-  // ✅ group macro defaults (persist)
   if (
     patch.groupMacroDefaults &&
     typeof patch.groupMacroDefaults === "object"
@@ -227,10 +239,8 @@ function setLayoutConfig(patch = {}) {
       groupMacroDefaults.jitterMs = Math.max(0, Number(gd.jitterMs) || 0);
   }
 
-  // ✅ device aliases (persist) — allow bulk overwrite
   if (patch.deviceAliases && typeof patch.deviceAliases === "object") {
     deviceAliases = { ...deviceAliases, ...patch.deviceAliases };
-    // cleanup invalid
     for (const k of Object.keys(deviceAliases)) {
       const v = String(deviceAliases[k] ?? "").trim();
       if (!v) delete deviceAliases[k];
@@ -255,7 +265,7 @@ function setDeviceAlias(deviceId, alias) {
   return { ok: true, deviceId: did, alias: deviceAliases[did] || "" };
 }
 
-// ===== slot manager =====
+// ========= slot manager =========
 const slotByDevice = new Map();
 let nextSlot = 0;
 
@@ -275,7 +285,7 @@ function portForSlot(slotIndex) {
   return SCRCPY_BASE_PORT + (slotIndex % 200);
 }
 
-// ===== window =====
+// ========= window =========
 function createWindow() {
   const win = new BrowserWindow({
     width: 1180,
@@ -358,7 +368,7 @@ function rawToPct(raw, axisMax) {
   return Math.max(0, Math.min(1, val / axisMax));
 }
 
-// ===== Core 4: Broadcast Engine instance =====
+// ========= Core 4: Broadcast Engine instance =========
 function loadMacroByIdFromStore(id) {
   return loadMacro(app.getPath("userData"), id);
 }
@@ -375,7 +385,165 @@ function initGroupBroadcast() {
   });
 }
 
+function sendMacroState(deviceId, state) {
+  safeSend("macro:state", { deviceId, ...state });
+}
+
+function sendMacroProgress(deviceId, payload) {
+  safeSend("macro:progress", { deviceId, ...payload });
+}
+
+// ========= Core 5: logger + auto recover =========
+let logger = null;
+
+// prevent spam restart
+const autoRecoverPending = new Set();
+
+function ensureInOrder(deviceId) {
+  if (!deviceOrder.includes(deviceId)) {
+    deviceOrder.push(deviceId);
+    persistSettings();
+  }
+}
+
+async function autoRecoverScrcpy(deviceId, reason) {
+  if (!layoutConfig.autoStartEnabled) return;
+  if (autoRecoverPending.has(deviceId)) return;
+
+  const ctx = registry.get(deviceId);
+  if (!ctx || ctx.state !== "ONLINE") return;
+
+  autoRecoverPending.add(deviceId);
+
+  try {
+    ensureInOrder(deviceId);
+
+    // wait a bit after reconnect so adb is stable
+    await sleep(450);
+
+    const snap = ctx.snapshot();
+    const slotIndex = Math.max(0, deviceOrder.indexOf(deviceId));
+    allocSlot(deviceId);
+    const port = portForSlot(slotIndex);
+
+    const { width, height, maxSize } = computeScrcpyCellAndMaxSize(
+      snap,
+      layoutConfig.scalePct
+    );
+
+    await scrcpy.start(deviceId, {
+      maxFps: 30,
+      bitRate: "8M",
+      port,
+      window: {
+        width,
+        height,
+        maxSize,
+        layout: {
+          mode: "grid",
+          slotIndex,
+          cols: layoutConfig.cols,
+          rows: layoutConfig.rows > 0 ? layoutConfig.rows : null,
+          margin: layoutConfig.margin,
+        },
+        borderless: false,
+        alwaysOnTop: false,
+        timeoutMs: 15000,
+      },
+      zOrder: { sendToBottom: true, noActivate: true },
+    });
+
+    logger?.health("autoRecover scrcpy:started", { deviceId, reason });
+
+    // ✅ wake screen so you SEE "bật lại màn hình"
+    if (layoutConfig.autoWakeOnRecover) {
+      try {
+        await input.wake(deviceId);
+        logger?.health("autoRecover wake:ok", { deviceId });
+      } catch (e) {
+        logger?.error("autoRecover wake:fail", {
+          deviceId,
+          message: String(e?.message || e || ""),
+        });
+      }
+    }
+  } catch (e) {
+    logger?.error("autoRecover scrcpy:fail", {
+      deviceId,
+      reason,
+      message: String(e?.message || e || ""),
+    });
+  } finally {
+    setTimeout(() => autoRecoverPending.delete(deviceId), 1500);
+  }
+}
+
+function attachRegistryLoggingAndRecover() {
+  registry.on("device:state", (evt) => {
+    const { deviceId, prev, next, changed, snapshot } = evt || {};
+    if (!deviceId) return;
+
+    if (changed) {
+      logger?.info("device:state", {
+        deviceId,
+        prev,
+        next,
+        onlineSince: snapshot?.onlineSince || null,
+        totalOnlineMs: snapshot?.totalOnlineMs || 0,
+        adbErrorCount: snapshot?.adbErrorCount || 0,
+      });
+
+      // OFFLINE -> ONLINE : auto recover
+      if (prev !== "ONLINE" && next === "ONLINE") {
+        autoRecoverScrcpy(deviceId, "reconnect");
+      }
+
+      // ONLINE -> OFFLINE : cleanup
+      if (prev === "ONLINE" && next !== "ONLINE") {
+        try {
+          if (scrcpy.isRunning(deviceId)) {
+            scrcpy.stop(deviceId).catch(() => {});
+            freeSlot(deviceId);
+          }
+        } catch {}
+      }
+    }
+  });
+
+  registry.on("device:adbError", (evt) => {
+    logger?.error("device:adbError", evt);
+  });
+
+  registry.on("registry:adbDown", (evt) => {
+    logger?.error("registry:adbDown", evt);
+  });
+}
+
+function attachProcessGuards() {
+  process.on("uncaughtException", (e) => {
+    logger?.error("process:uncaughtException", {
+      message: String(e?.stack || e),
+    });
+  });
+  process.on("unhandledRejection", (e) => {
+    logger?.error("process:unhandledRejection", {
+      message: String(e?.stack || e),
+    });
+  });
+}
+
 app.whenReady().then(() => {
+  // init window first for log streaming
+  mainWindow = createWindow();
+
+  logger = new Logger({
+    userDataPath: app.getPath("userData"),
+    onLine: (line) => safeSend("log:line", line),
+  });
+
+  attachProcessGuards();
+
+  // load settings
   const saved = readSettingsFile();
   if (saved && typeof saved === "object") {
     setDeviceOrder(saved.deviceOrder || []);
@@ -389,11 +557,18 @@ app.whenReady().then(() => {
       saved.forceResizeOnApply ?? layoutConfig.forceResizeOnApply
     );
 
+    // ✅ Core 5 load
+    layoutConfig.autoStartEnabled = !!(
+      saved.autoStartEnabled ?? layoutConfig.autoStartEnabled
+    );
+    layoutConfig.autoWakeOnRecover = !!(
+      saved.autoWakeOnRecover ?? layoutConfig.autoWakeOnRecover
+    );
+
     if (Array.isArray(saved.groups)) {
       groupManager = new GroupManager(saved.groups);
     }
 
-    // ✅ load persisted defaults
     if (
       saved.broadcastDefaults &&
       typeof saved.broadcastDefaults === "object"
@@ -421,50 +596,66 @@ app.whenReady().then(() => {
 
   initGroupBroadcast();
 
-  mainWindow = createWindow();
+  attachRegistryLoggingAndRecover();
+
+  // start polling after listeners attached
   registry.startPolling(1500);
 
+  // scrcpy close handling
   scrcpy.on("closed", ({ deviceId, code, signal }) => {
     freeSlot(deviceId);
-    if (!mainWindow || mainWindow.isDestroyed()) return;
-    mainWindow.webContents.send("scrcpy:closed", { deviceId, code, signal });
+    safeSend("scrcpy:closed", { deviceId, code, signal });
+
+    logger?.audit("scrcpy:closed", { deviceId, code, signal });
+
+    // ✅ Core 5: auto recover if closed unexpectedly & device still ONLINE
+    if (layoutConfig.autoStartEnabled) {
+      autoRecoverScrcpy(deviceId, "scrcpy_closed");
+    }
   });
 
-  // ===== devices =====
+  // ========= IPC: logs =========
+  ipcMain.handle("log:tail", async (_, { maxLines }) => {
+    return logger?.tailLines(Number(maxLines) || 250) || [];
+  });
+
+  // ========= devices =========
   ipcMain.handle("devices:list", async () => {
     const list = registry.listSnapshots();
     const sorted = sortDevicesByOrder(list);
-    // enrich alias
     return sorted.map((d) => ({
       ...d,
       alias: deviceAliases[d.deviceId] || "",
     }));
   });
 
-  // ✅ alias get/set
+  // alias get/set
   ipcMain.handle("device:aliasSet", async (_, { deviceId, alias }) => {
-    return setDeviceAlias(deviceId, alias);
+    const r = setDeviceAlias(deviceId, alias);
+    logger?.audit("device:aliasSet", { deviceId, alias: r.alias || "" });
+    return r;
   });
 
   ipcMain.handle("device:aliasGetAll", async () => {
     return { ...deviceAliases };
   });
 
-  // ===== layout config =====
+  // layout
   ipcMain.handle("layout:get", async () => getLayoutConfig());
   ipcMain.handle("layout:set", async (_, patch) => {
     setLayoutConfig(patch);
+    logger?.audit("layout:set", {
+      autoStartEnabled: layoutConfig.autoStartEnabled,
+      autoWakeOnRecover: layoutConfig.autoWakeOnRecover,
+      scalePct: layoutConfig.scalePct,
+      cols: layoutConfig.cols,
+      rows: layoutConfig.rows,
+      margin: layoutConfig.margin,
+    });
     return getLayoutConfig();
   });
 
-  function ensureInOrder(deviceId) {
-    if (!deviceOrder.includes(deviceId)) {
-      deviceOrder.push(deviceId);
-      persistSettings();
-    }
-  }
-
-  // ===== scrcpy lifecycle =====
+  // ========= scrcpy lifecycle =========
   ipcMain.handle("scrcpy:start", async (_, { deviceId }) => {
     const cfg = getLayoutConfig();
     const ctx = ensureOnline(registry.get(deviceId));
@@ -503,12 +694,14 @@ app.whenReady().then(() => {
       zOrder: { sendToBottom: true, noActivate: true },
     });
 
+    logger?.audit("scrcpy:start", { deviceId });
     return { ok: true };
   });
 
   ipcMain.handle("scrcpy:stop", async (_, { deviceId }) => {
     await scrcpy.stop(deviceId);
     freeSlot(deviceId);
+    logger?.audit("scrcpy:stop", { deviceId });
     return true;
   });
 
@@ -562,11 +755,18 @@ app.whenReady().then(() => {
         });
 
         started.push(d.deviceId);
-      } catch {}
+        logger?.audit("scrcpy:startAll:item", { deviceId: d.deviceId });
+      } catch (e) {
+        logger?.error("scrcpy:startAll:itemFail", {
+          deviceId: d.deviceId,
+          message: String(e?.message || e || ""),
+        });
+      }
 
       await sleep(180);
     }
 
+    logger?.audit("scrcpy:startAll", { count: started.length });
     return started;
   });
 
@@ -574,6 +774,7 @@ app.whenReady().then(() => {
     await scrcpy.stopAll();
     slotByDevice.clear();
     nextSlot = 0;
+    logger?.audit("scrcpy:stopAll", {});
     return true;
   });
 
@@ -623,41 +824,49 @@ app.whenReady().then(() => {
       }
     );
 
+    logger?.audit("scrcpy:applyLayout", { count: items.length, forceResize });
     return { ok: true, count: items.length, forceResize };
   });
 
-  // ===== Control panel actions =====
+  // ========= Control panel actions =========
   ipcMain.handle("control:home", async (_, { deviceId }) => {
+    logger?.audit("control:home", { deviceId });
     const ctx = ensureOnline(registry.get(deviceId));
     return ctx.enqueue(() => input.home(deviceId));
   });
 
   ipcMain.handle("control:back", async (_, { deviceId }) => {
+    logger?.audit("control:back", { deviceId });
     const ctx = ensureOnline(registry.get(deviceId));
     return ctx.enqueue(() => input.back(deviceId));
   });
 
   ipcMain.handle("control:recents", async (_, { deviceId }) => {
+    logger?.audit("control:recents", { deviceId });
     const ctx = ensureOnline(registry.get(deviceId));
     return ctx.enqueue(() => input.recents(deviceId));
   });
 
   ipcMain.handle("control:wake", async (_, { deviceId }) => {
+    logger?.audit("control:wake", { deviceId });
     const ctx = ensureOnline(registry.get(deviceId));
     return ctx.enqueue(() => input.wake(deviceId));
   });
 
   ipcMain.handle("control:screenOff", async (_, { deviceId }) => {
+    logger?.audit("control:screenOff", { deviceId });
     const ctx = ensureOnline(registry.get(deviceId));
     return ctx.enqueue(() => input.screenOff(deviceId));
   });
 
   ipcMain.handle("control:shutdown", async (_, { deviceId }) => {
+    logger?.audit("control:shutdown", { deviceId });
     const ctx = ensureOnline(registry.get(deviceId));
     return ctx.enqueue(() => input.shutdown(deviceId));
   });
 
   ipcMain.handle("control:tapRaw", async (_, { deviceId, x, y }) => {
+    logger?.audit("control:tapRaw", { deviceId, x, y });
     const ctx = ensureOnline(registry.get(deviceId));
     return ctx.enqueue(async () => {
       const snap = ctx.snapshot();
@@ -679,6 +888,7 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle("control:swipeRaw", async (_, payload) => {
+    logger?.audit("control:swipeRaw", payload);
     const ctx = ensureOnline(registry.get(payload.deviceId));
     return ctx.enqueue(async () => {
       const snap = ctx.snapshot();
@@ -706,6 +916,7 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle("control:swipeDir", async (_, { deviceId, dir }) => {
+    logger?.audit("control:swipeDir", { deviceId, dir });
     const ctx = ensureOnline(registry.get(deviceId));
     return ctx.enqueue(async () => {
       const snap = ctx.snapshot();
@@ -734,10 +945,12 @@ app.whenReady().then(() => {
     });
   });
 
-  // ===== Macro IPC =====
+  // ========= Macro IPC =========
   ipcMain.handle("macro:list", async () => listMacros(app.getPath("userData")));
 
   ipcMain.handle("macro:recordStart", async (_, { deviceId }) => {
+    logger?.audit("macro:recordStart", { deviceId });
+
     const ctx = ensureOnline(registry.get(deviceId));
     const snap = ctx.snapshot();
     const res = snap.resolution;
@@ -774,6 +987,7 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle("macro:recordStop", async () => {
+    logger?.audit("macro:recordStop", {});
     try {
       hook.stop();
     } catch {}
@@ -782,16 +996,19 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle("macro:recordAddText", async (_, { text }) => {
+    logger?.audit("macro:recordAddText", { text });
     recorder.injectText(text);
     return { ok: true };
   });
 
   ipcMain.handle("macro:recordAddKey", async (_, { key }) => {
+    logger?.audit("macro:recordAddKey", { key });
     recorder.injectKey(key);
     return { ok: true };
   });
 
   ipcMain.handle("macro:recordAddWait", async (_, { durationMs }) => {
+    logger?.audit("macro:recordAddWait", { durationMs });
     recorder.injectWait(durationMs);
     return { ok: true };
   });
@@ -818,14 +1035,22 @@ app.whenReady().then(() => {
       steps: Array.isArray(steps) ? steps : [],
     };
 
+    logger?.audit("macro:save", {
+      id,
+      name: macro.meta.name,
+      steps: macro.steps.length,
+    });
     return saveMacro(app.getPath("userData"), macro);
   });
 
   ipcMain.handle("macro:load", async (_, { id }) => {
+    logger?.audit("macro:load", { id });
     return loadMacro(app.getPath("userData"), id);
   });
 
   ipcMain.handle("macro:play", async (_, { deviceId, macroId, options }) => {
+    logger?.audit("macro:play", { deviceId, macroId, options });
+
     const ctx = ensureOnline(registry.get(deviceId));
     const macro = loadMacro(app.getPath("userData"), macroId);
 
@@ -868,6 +1093,7 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle("macro:stop", async (_, { deviceId }) => {
+    logger?.audit("macro:stop", { deviceId });
     const s = runningMacroByDevice.get(deviceId);
     if (s) {
       s.stop = true;
@@ -876,14 +1102,13 @@ app.whenReady().then(() => {
     return { ok: true };
   });
 
-  // ======================
-  // Groups IPC
-  // ======================
+  // ========= Groups IPC =========
   ipcMain.handle("group:list", async () => groupManager.list());
 
   ipcMain.handle("group:create", async (_, { id, name }) => {
     const g = groupManager.create(id, name);
     persistSettings();
+    logger?.audit("group:create", { id: g.id, name: g.name });
     return {
       ok: true,
       group: { id: g.id, name: g.name, devices: Array.from(g.devices) },
@@ -893,6 +1118,7 @@ app.whenReady().then(() => {
   ipcMain.handle("group:rename", async (_, { id, name }) => {
     const g = groupManager.rename(id, name);
     persistSettings();
+    logger?.audit("group:rename", { id: g.id, name: g.name });
     return {
       ok: true,
       group: { id: g.id, name: g.name, devices: Array.from(g.devices) },
@@ -902,23 +1128,27 @@ app.whenReady().then(() => {
   ipcMain.handle("group:remove", async (_, { id }) => {
     groupManager.remove(id);
     persistSettings();
+    logger?.audit("group:remove", { id });
     return { ok: true };
   });
 
   ipcMain.handle("group:addDevice", async (_, { groupId, deviceId }) => {
     groupManager.addDevice(groupId, deviceId);
     persistSettings();
+    logger?.audit("group:addDevice", { groupId, deviceId });
     return { ok: true };
   });
 
   ipcMain.handle("group:removeDevice", async (_, { groupId, deviceId }) => {
     groupManager.removeDevice(groupId, deviceId);
     persistSettings();
+    logger?.audit("group:removeDevice", { groupId, deviceId });
     return { ok: true };
   });
 
   // ---- Group Broadcast ----
   ipcMain.handle("group:tapPct", async (_, { groupId, xPct, yPct, opts }) => {
+    logger?.audit("group:tapPct", { groupId, xPct, yPct, opts });
     return groupBroadcast.tapPct(
       groupId,
       Number(xPct),
@@ -930,6 +1160,15 @@ app.whenReady().then(() => {
   ipcMain.handle(
     "group:swipePct",
     async (_, { groupId, x1Pct, y1Pct, x2Pct, y2Pct, durationMs, opts }) => {
+      logger?.audit("group:swipePct", {
+        groupId,
+        x1Pct,
+        y1Pct,
+        x2Pct,
+        y2Pct,
+        durationMs,
+        opts,
+      });
       return groupBroadcast.swipePct(
         groupId,
         Number(x1Pct),
@@ -943,22 +1182,27 @@ app.whenReady().then(() => {
   );
 
   ipcMain.handle("group:swipeDir", async (_, { groupId, dir, opts }) => {
+    logger?.audit("group:swipeDir", { groupId, dir, opts });
     return groupBroadcast.swipeDir(groupId, dir, opts || {});
   });
 
   ipcMain.handle("group:key", async (_, { groupId, key, opts }) => {
+    logger?.audit("group:key", { groupId, key, opts });
     return groupBroadcast.key(groupId, key, opts || {});
   });
 
   ipcMain.handle("group:wake", async (_, { groupId, opts }) => {
+    logger?.audit("group:wake", { groupId, opts });
     return groupBroadcast.wake(groupId, opts || {});
   });
 
   ipcMain.handle("group:screenOff", async (_, { groupId, opts }) => {
+    logger?.audit("group:screenOff", { groupId, opts });
     return groupBroadcast.screenOff(groupId, opts || {});
   });
 
   ipcMain.handle("group:shutdown", async (_, { groupId, opts }) => {
+    logger?.audit("group:shutdown", { groupId, opts });
     return groupBroadcast.shutdown(groupId, opts || {});
   });
 
@@ -966,6 +1210,12 @@ app.whenReady().then(() => {
   ipcMain.handle(
     "group:macroPlay",
     async (_, { groupId, macroId, options, fanoutOpts }) => {
+      logger?.audit("group:macroPlay", {
+        groupId,
+        macroId,
+        options,
+        fanoutOpts,
+      });
       return groupBroadcast.playMacro(
         groupId,
         macroId,
@@ -976,10 +1226,12 @@ app.whenReady().then(() => {
   );
 
   ipcMain.handle("group:macroStopGroup", async (_, { groupId }) => {
+    logger?.audit("group:macroStopGroup", { groupId });
     return groupBroadcast.stopGroup(groupId);
   });
 
   ipcMain.handle("group:macroStopDevice", async (_, { groupId, deviceId }) => {
+    logger?.audit("group:macroStopDevice", { groupId, deviceId });
     return groupBroadcast.stopDevice(groupId, deviceId);
   });
 
@@ -989,10 +1241,22 @@ app.whenReady().then(() => {
 
   app.on("before-quit", () => {
     persistSettings();
+    logger?.info("app:beforeQuit", {});
   });
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) mainWindow = createWindow();
+  });
+
+  // show last log lines in UI quickly
+  try {
+    const tail = logger.tailLines(120);
+    for (const line of tail) safeSend("log:line", line);
+  } catch {}
+
+  logger?.info("app:ready", {
+    autoStartEnabled: layoutConfig.autoStartEnabled,
+    autoWakeOnRecover: layoutConfig.autoWakeOnRecover,
   });
 });
 

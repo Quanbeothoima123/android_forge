@@ -1,4 +1,5 @@
 // controller/deviceRegistry.js
+const { EventEmitter } = require("events");
 const {
   listDevicesRaw,
   fetchDeviceInfo,
@@ -6,11 +7,17 @@ const {
 } = require("./deviceManager");
 const { DeviceContext } = require("./deviceContext");
 
-class DeviceRegistry {
+class DeviceRegistry extends EventEmitter {
   constructor() {
+    super();
     this.map = new Map(); // deviceId -> DeviceContext
     this._pollTimer = null;
     this._isPolling = false;
+
+    // track last poll adb failure
+    this._lastPollErrorAt = 0;
+    this._pollErrorCount = 0;
+    this._lastPollErrorMsg = "";
   }
 
   startPolling(intervalMs = 1500) {
@@ -32,6 +39,31 @@ class DeviceRegistry {
     return Array.from(this.map.values()).map((ctx) => ctx.snapshot());
   }
 
+  _emitState(ctx, transition) {
+    // transition: {changed, prev, next}
+    try {
+      this.emit("device:state", {
+        deviceId: ctx.deviceId,
+        prev: transition?.prev,
+        next: transition?.next,
+        changed: !!transition?.changed,
+        snapshot: ctx.snapshot(),
+      });
+    } catch {}
+  }
+
+  _emitAdbError(ctx, err, phase) {
+    try {
+      this.emit("device:adbError", {
+        deviceId: ctx?.deviceId || "",
+        phase: phase || "",
+        message: String(err?.message || err || ""),
+        at: Date.now(),
+        snapshot: ctx ? ctx.snapshot() : null,
+      });
+    } catch {}
+  }
+
   async pollOnce() {
     if (this._isPolling) return;
     this._isPolling = true;
@@ -40,11 +72,14 @@ class DeviceRegistry {
       const devices = await listDevicesRaw();
       const seen = new Set(devices.map((d) => d.deviceId));
 
-      // Mark removed devices
+      // Mark removed devices as OFFLINE
       for (const [id, ctx] of this.map.entries()) {
         if (!seen.has(id)) {
-          ctx.state = "OFFLINE";
-          ctx.agentReady = false;
+          const t = ctx.updateFromDiscovery({
+            state: "OFFLINE",
+            model: ctx.model,
+          });
+          this._emitState(ctx, t);
         }
       }
 
@@ -56,7 +91,11 @@ class DeviceRegistry {
           this.map.set(d.deviceId, ctx);
         }
 
-        ctx.updateFromDiscovery({ state: d.state, model: d.model });
+        const transition = ctx.updateFromDiscovery({
+          state: d.state,
+          model: d.model,
+        });
+        if (transition.changed) this._emitState(ctx, transition);
 
         // If ONLINE and missing info, fetch info in its own queue
         if (
@@ -66,8 +105,13 @@ class DeviceRegistry {
           ctx
             .enqueue(async () => {
               if (ctx.state !== "ONLINE") return;
-              const info = await fetchDeviceInfo(ctx.deviceId, ctx.model);
-              ctx.setInfo(info);
+              try {
+                const info = await fetchDeviceInfo(ctx.deviceId, ctx.model);
+                ctx.setInfo(info);
+              } catch (e) {
+                ctx.markAdbError(e);
+                this._emitAdbError(ctx, e, "fetchDeviceInfo");
+              }
             })
             .catch(() => {});
         }
@@ -77,16 +121,30 @@ class DeviceRegistry {
           ctx
             .enqueue(async () => {
               if (ctx.state !== "ONLINE") return;
-              const ok = await checkAgentReady(ctx.deviceId);
-              ctx.setAgentReady(ok);
+              try {
+                const ok = await checkAgentReady(ctx.deviceId);
+                ctx.setAgentReady(ok);
+              } catch (e) {
+                ctx.markAdbError(e);
+                this._emitAdbError(ctx, e, "checkAgentReady");
+              }
             })
-            .catch(() => {
-              // If adb fails, keep last known state
-            });
+            .catch(() => {});
         }
       }
     } catch (e) {
-      // If adb is down, don't crash the app; registry stays as-is
+      // ADB is down or frozen. Don't crash; emit registry-level error for health/logging.
+      this._pollErrorCount += 1;
+      this._lastPollErrorAt = Date.now();
+      this._lastPollErrorMsg = String(e?.message || e || "");
+
+      try {
+        this.emit("registry:adbDown", {
+          at: this._lastPollErrorAt,
+          count: this._pollErrorCount,
+          message: this._lastPollErrorMsg,
+        });
+      } catch {}
     } finally {
       this._isPolling = false;
     }

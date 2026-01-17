@@ -2,13 +2,15 @@
 const { app, BrowserWindow, ipcMain } = require("electron");
 const path = require("path");
 const fs = require("fs");
-const { randomUUID } = require("crypto");
+const { randomUUID, createHash } = require("crypto");
+const http = require("http");
+const https = require("https");
 
 const { DeviceRegistry } = require("./controller/deviceRegistry");
 const { scrcpy } = require("./controller/scrcpyController");
 const input = require("./controller/inputControllerAdb");
 
-// Core 3
+// Macro core
 const { MacroRecorder } = require("./macro/macroRecorder");
 const { listMacros, loadMacro, saveMacro } = require("./macro/macroStore");
 const { runMacroOnDevice } = require("./macro/macroRunner");
@@ -16,12 +18,15 @@ const { runMacroOnDevice } = require("./macro/macroRunner");
 // V2 Hook
 const { ScrcpyHook } = require("./macro/scrcpyHook");
 
-// Core 4
+// Groups
 const { GroupManager } = require("./controller/groupManager");
 const { GroupBroadcast } = require("./controller/groupBroadcast");
 
-// ✅ Core 5: Logger
+// Logger
 const { Logger } = require("./controller/logger");
+
+// Agent socket helpers
+const { ensureForward, sendJsonLine } = require("./controller/socketClient");
 
 if (require("electron-squirrel-startup")) {
   app.quit();
@@ -94,6 +99,26 @@ function normalizeScalePct(pct) {
   return best;
 }
 
+function parseLoopCount(loopRaw) {
+  // Convention: loop <= 0 => infinite (UI shows ∞)
+  const s = typeof loopRaw === "string" ? loopRaw.trim() : "";
+  if (s) {
+    if (s === "∞" || /^inf(inite)?$/i.test(s))
+      return { infinite: true, total: 0 };
+    const n = Number(s);
+    if (Number.isFinite(n)) {
+      if (n <= 0) return { infinite: true, total: 0 };
+      return { infinite: false, total: Math.max(1, Math.floor(n)) };
+    }
+    return { infinite: false, total: 1 };
+  }
+
+  const n = Number(loopRaw);
+  if (!Number.isFinite(n)) return { infinite: false, total: 1 };
+  if (n <= 0) return { infinite: true, total: 0 };
+  return { infinite: false, total: Math.max(1, Math.floor(n)) };
+}
+
 // ========= Device order =========
 let deviceOrder = [];
 function setDeviceOrder(newOrder) {
@@ -129,10 +154,7 @@ const layoutConfig = {
   margin: 8,
   forceResizeOnApply: true,
 
-  // ✅ Core 5: move AutoStart to MAIN (reliable long-run)
   autoStartEnabled: false,
-
-  // ✅ Core 5: wake screen after auto recover (default true)
   autoWakeOnRecover: true,
 };
 
@@ -151,6 +173,42 @@ let groupMacroDefaults = {
 // deviceId -> alias
 let deviceAliases = {}; // { [deviceId]: "My Name" }
 
+// ========= TikTok Harvest (NEW CORE) persisted config =========
+let tiktokConfig = {
+  endpointUrl:
+    "https://script.google.com/macros/s/AKfycby6saWjkNjYMrCevS9V769yaF8jJDeVCY5X8eeNW8tx9-fqbUB2VemXZL-EnJpiN68d/exec",
+  token: "secret-farm-12345",
+  groupId: "Farm_HCM",
+  macroId: "",
+
+  // batching
+  batchSize: 15,
+  flushEveryMs: 15000,
+  httpTimeoutMs: 12000,
+
+  // live detection keywords
+  liveKeywords: [
+    "Nhấn để xem LIVE",
+    "phiên LIVE",
+    "Đang LIVE",
+    "Gửi quà",
+    "Tặng quà",
+  ],
+
+  // if gặp LIVE liên tiếp -> thoát
+  liveMaxConsecutive: 3,
+
+  // after each cycle always swipe next
+  swipeAfterEach: true,
+
+  // poll clipboard
+  clipboardPollEveryMs: 260,
+  clipboardPollTimeoutMs: 3500,
+
+  // general loop delay
+  loopDelayMs: 180,
+};
+
 // ========= Groups (persisted) =========
 let groupManager = new GroupManager([]);
 
@@ -166,11 +224,14 @@ function getLayoutConfig() {
     broadcastDefaults,
     groupMacroDefaults,
     deviceAliases,
+
+    // ✅ include tiktok core config
+    tiktokConfig,
   };
 }
 
 function persistSettings() {
-  writeSettingsFile({ v: 4, ...getLayoutConfig() });
+  writeSettingsFile({ v: 5, ...getLayoutConfig() });
 }
 
 function setLayoutConfig(patch = {}) {
@@ -246,6 +307,45 @@ function setLayoutConfig(patch = {}) {
       if (!v) delete deviceAliases[k];
       else deviceAliases[k] = v;
     }
+  }
+
+  // ✅ tiktok config patch
+  if (patch.tiktokConfig && typeof patch.tiktokConfig === "object") {
+    tiktokConfig = { ...tiktokConfig, ...patch.tiktokConfig };
+    // sanitize numbers
+    tiktokConfig.batchSize = Math.max(1, Number(tiktokConfig.batchSize) || 15);
+    tiktokConfig.flushEveryMs = Math.max(
+      2000,
+      Number(tiktokConfig.flushEveryMs) || 15000
+    );
+    tiktokConfig.httpTimeoutMs = Math.max(
+      2000,
+      Number(tiktokConfig.httpTimeoutMs) || 12000
+    );
+    tiktokConfig.clipboardPollEveryMs = Math.max(
+      120,
+      Number(tiktokConfig.clipboardPollEveryMs) || 260
+    );
+    tiktokConfig.clipboardPollTimeoutMs = Math.max(
+      800,
+      Number(tiktokConfig.clipboardPollTimeoutMs) || 3500
+    );
+    tiktokConfig.liveMaxConsecutive = Math.max(
+      1,
+      Number(tiktokConfig.liveMaxConsecutive) || 3
+    );
+    tiktokConfig.loopDelayMs = Math.max(
+      0,
+      Number(tiktokConfig.loopDelayMs) || 180
+    );
+    if (!Array.isArray(tiktokConfig.liveKeywords))
+      tiktokConfig.liveKeywords = [
+        "Nhấn để xem LIVE",
+        "phiên LIVE",
+        "Đang LIVE",
+        "Gửi quà",
+        "Tặng quà",
+      ];
   }
 
   persistSettings();
@@ -455,7 +555,6 @@ async function autoRecoverScrcpy(deviceId, reason) {
 
     logger?.health("autoRecover scrcpy:started", { deviceId, reason });
 
-    // ✅ wake screen so you SEE "bật lại màn hình"
     if (layoutConfig.autoWakeOnRecover) {
       try {
         await input.wake(deviceId);
@@ -493,12 +592,10 @@ function attachRegistryLoggingAndRecover() {
         adbErrorCount: snapshot?.adbErrorCount || 0,
       });
 
-      // OFFLINE -> ONLINE : auto recover
       if (prev !== "ONLINE" && next === "ONLINE") {
         autoRecoverScrcpy(deviceId, "reconnect");
       }
 
-      // ONLINE -> OFFLINE : cleanup
       if (prev === "ONLINE" && next !== "ONLINE") {
         try {
           if (scrcpy.isRunning(deviceId)) {
@@ -532,6 +629,797 @@ function attachProcessGuards() {
   });
 }
 
+// ===============================
+// TikTok Harvest (NEW CORE)
+// ===============================
+const TIKTOK_QUEUE_FILE = () =>
+  path.join(app.getPath("userData"), "tiktok_queue.json");
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function isTikTokUrl(u) {
+  const s = String(u || "").trim();
+  if (!s) return false;
+  if (!/^https?:\/\//i.test(s)) return false;
+  return /tiktok\.com\//i.test(s);
+}
+
+function sha1(s) {
+  return createHash("sha1")
+    .update(String(s || ""), "utf8")
+    .digest("hex");
+}
+
+// agent forward host port (avoid collision; stable by deviceOrder index)
+const AGENT_HOST_BASE = 38183; // local port start
+function agentHostPortForDevice(deviceId) {
+  ensureInOrder(deviceId);
+  const idx = Math.max(0, deviceOrder.indexOf(deviceId));
+  return AGENT_HOST_BASE + (idx % 2000); // big enough
+}
+
+// agent call: returns {ok, line}
+async function agentCallLine(deviceId, payload, timeoutMs = 1200) {
+  const hostPort = agentHostPortForDevice(deviceId);
+  await ensureForward(deviceId, hostPort);
+  return await sendJsonLine(hostPort, payload, timeoutMs);
+}
+
+// parse "OK <json>" line
+function parseOkJson(line) {
+  const s = String(line || "");
+  if (!s.startsWith("OK")) return null;
+  const rest = s.slice(2).trim();
+  if (!rest) return {};
+  try {
+    return JSON.parse(rest);
+  } catch {
+    return null;
+  }
+}
+
+async function agentClipboardGet(deviceId) {
+  const r = await agentCallLine(deviceId, { type: "CLIPBOARD_GET" }, 1800);
+  if (!r.ok) throw new Error(r.line || "ERR clipboard");
+  const obj = parseOkJson(r.line);
+  const text = obj?.text != null ? String(obj.text) : "";
+  return text;
+}
+
+async function agentFindText(deviceId, query) {
+  const q = String(query || "").trim();
+  if (!q) return { found: false };
+  const r = await agentCallLine(
+    deviceId,
+    { type: "FIND_TEXT", query: q, ignoreCase: true, mode: "contains" },
+    2200
+  );
+  if (!r.ok) return { found: false, error: r.line || "" };
+  const obj = parseOkJson(r.line);
+  if (!obj) return { found: false };
+  return obj;
+}
+
+async function agentClickText(deviceId, query) {
+  const q = String(query || "").trim();
+  if (!q) return { found: false, clicked: false };
+
+  const r = await agentCallLine(
+    deviceId,
+    { type: "CLICK_TEXT", query: q, ignoreCase: true, mode: "contains" },
+    2200
+  );
+  if (!r.ok) return { found: false, clicked: false, error: r.line || "" };
+
+  const obj = parseOkJson(r.line);
+  if (!obj) return { found: false, clicked: false };
+  return obj; // {found, clicked, text, x1,y1,x2,y2}
+}
+
+async function agentFindDesc(deviceId, query) {
+  const q = String(query || "").trim();
+  if (!q) return { found: false };
+
+  const r = await agentCallLine(
+    deviceId,
+    { type: "FIND_DESC", query: q, ignoreCase: true, mode: "contains" },
+    2200
+  );
+  if (!r.ok) return { found: false, error: r.line || "" };
+
+  const obj = parseOkJson(r.line);
+  return obj || { found: false };
+}
+
+async function agentClickDesc(deviceId, query) {
+  const q = String(query || "").trim();
+  if (!q) return { found: false, clicked: false };
+
+  const r = await agentCallLine(
+    deviceId,
+    { type: "CLICK_DESC", query: q, ignoreCase: true, mode: "contains" },
+    2200
+  );
+  if (!r.ok) return { found: false, clicked: false, error: r.line || "" };
+
+  const obj = parseOkJson(r.line);
+  return obj || { found: false, clicked: false };
+}
+
+async function agentClickId(deviceId, query) {
+  const q = String(query || "").trim();
+  if (!q) return { found: false, clicked: false };
+
+  const r = await agentCallLine(
+    deviceId,
+    { type: "CLICK_ID", query: q, ignoreCase: true, mode: "contains" },
+    2200
+  );
+  if (!r.ok) return { found: false, clicked: false, error: r.line || "" };
+
+  const obj = parseOkJson(r.line);
+  return obj || { found: false, clicked: false };
+}
+
+async function agentOpenShare(deviceId) {
+  const r = await agentCallLine(deviceId, { type: "OPEN_SHARE" }, 3800);
+  if (!r.ok) return { opened: false, raw: r.line || "" };
+  const obj = parseOkJson(r.line);
+  return { opened: !!obj?.opened, obj };
+}
+
+async function pollClipboardForTikTokUrl(deviceId, baseline, cfg) {
+  const every = Math.max(120, Number(cfg.clipboardPollEveryMs) || 260);
+  const timeout = Math.max(800, Number(cfg.clipboardPollTimeoutMs) || 3500);
+  const started = Date.now();
+
+  while (Date.now() - started < timeout) {
+    const cur = await agentClipboardGet(deviceId);
+    if (cur && cur !== baseline && isTikTokUrl(cur)) return cur;
+    await sleep(every);
+  }
+  return "";
+}
+
+function _centerFromBounds(obj) {
+  const x1 = Number(obj?.x1),
+    y1 = Number(obj?.y1),
+    x2 = Number(obj?.x2),
+    y2 = Number(obj?.y2);
+  if (![x1, y1, x2, y2].every(Number.isFinite)) return null;
+  return { x: Math.round((x1 + x2) / 2), y: Math.round((y1 + y2) / 2) };
+}
+
+async function isShareSheetOpen(deviceId) {
+  // Share sheet TikTok thường có "Gửi đến" (VN) hoặc "Send to" (EN)
+  const markers = ["Gửi đến", "Send to", "Sao chép liên kết", "Copy link"];
+  for (const m of markers) {
+    const r = await agentFindText(deviceId, m);
+    if (r?.found) return true;
+  }
+  return false;
+}
+
+async function openShareSheet(ctx) {
+  const deviceId = ctx.deviceId;
+
+  if (await isShareSheetOpen(deviceId)) return true;
+
+  // ✅ ưu tiên OPEN_SHARE (node-scan) -> không phụ thuộc tọa độ icon Share
+  try {
+    const r = await agentOpenShare(deviceId);
+    if (r.opened) {
+      await sleep(220);
+      if (await isShareSheetOpen(deviceId)) return true;
+    }
+  } catch {}
+
+  // Ưu tiên click theo contentDescription (Accessibility)
+  const descKeywords = ["Chia sẻ", "Share"];
+  for (let round = 1; round <= 2; round++) {
+    for (const kw of descKeywords) {
+      const r = await agentClickDesc(deviceId, kw);
+
+      // nếu found nhưng clicked=false (node không clickable) -> tap vào center bounds
+      if (r?.found && !r?.clicked) {
+        const c = _centerFromBounds(r);
+        if (c) {
+          await agentCallLine(deviceId, { type: "TAP", x: c.x, y: c.y }, 1200);
+          await sleep(220);
+        }
+      } else if (r?.found && r?.clicked) {
+        await sleep(250);
+      }
+
+      if (await isShareSheetOpen(deviceId)) return true;
+    }
+  }
+
+  // Fallback theo viewId (không phải máy nào cũng có, nhưng thêm cũng không hại)
+  const idKeywords = ["share", "Share"];
+  for (const kw of idKeywords) {
+    const r = await agentClickId(deviceId, kw);
+    if (r?.found && (r?.clicked || _centerFromBounds(r))) {
+      if (!r.clicked) {
+        const c = _centerFromBounds(r);
+        if (c)
+          await agentCallLine(deviceId, { type: "TAP", x: c.x, y: c.y }, 1200);
+      }
+      await sleep(250);
+      if (await isShareSheetOpen(deviceId)) return true;
+    }
+  }
+
+  return false;
+}
+
+async function clickCopyLinkOnShareSheet(ctx) {
+  const deviceId = ctx.deviceId;
+  // Nếu share sheet chưa mở thì khỏi mò copy link
+  if (!(await isShareSheetOpen(deviceId))) return false;
+
+  // ưu tiên text chuẩn; có thể bổ sung theo ngôn ngữ máy
+  const keywords =
+    Array.isArray(tiktokConfig.copyLinkKeywords) &&
+    tiktokConfig.copyLinkKeywords.length
+      ? tiktokConfig.copyLinkKeywords
+      : ["Sao chép liên kết", "Copy link", "Copy Link"];
+
+  // thử vài lần: click_text -> fallback tap center -> scroll sheet -> thử lại
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    // 1) CLICK_TEXT
+    for (const kw of keywords) {
+      const r = await agentClickText(deviceId, kw);
+      if (r?.found && r?.clicked) {
+        tiktokLog("copybtn:clicked", { deviceId, kw, attempt });
+        return true;
+      }
+    }
+
+    // 2) fallback: FIND_TEXT rồi TAP center (trường hợp node không clickable)
+    for (const kw of keywords) {
+      const f = await agentFindText(deviceId, kw);
+      if (f?.found) {
+        const c = _centerFromBounds(f);
+        if (c) {
+          await agentCallLine(deviceId, { type: "TAP", x: c.x, y: c.y }, 1200);
+          tiktokLog("copybtn:tap_center", { deviceId, kw, attempt });
+          await sleep(180);
+          break; // break vòng keywords fallback, rồi attempt++ sẽ chạy tiếp
+        }
+      }
+    }
+
+    // 3) scroll nhẹ trong share sheet để lộ nút (nếu bị đẩy xuống)
+    const snap = ctx.snapshot?.() || {};
+    const res = snap.resolution || { width: 1080, height: 1920 };
+    const x = Math.round(res.width * 0.5);
+    const y1 = Math.round(res.height * 0.86);
+    const y2 = Math.round(res.height * 0.6);
+
+    try {
+      await ctx.enqueue(async () => {
+        await input.swipe(deviceId, x, y1, x, y2, 220);
+      });
+    } catch {}
+
+    await sleep(220);
+  }
+
+  return false;
+}
+
+function postJson(urlStr, bodyObj, timeoutMs = 12000) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const data = Buffer.from(JSON.stringify(bodyObj), "utf8");
+
+    const mod = u.protocol === "https:" ? https : http;
+
+    const req = mod.request(
+      {
+        protocol: u.protocol,
+        hostname: u.hostname,
+        port: u.port ? Number(u.port) : u.protocol === "https:" ? 443 : 80,
+        path: u.pathname + (u.search || ""),
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": data.length,
+        },
+        timeout: timeoutMs,
+      },
+      (res) => {
+        let out = "";
+        res.on("data", (d) => (out += d.toString("utf8")));
+        res.on("end", () => {
+          const code = res.statusCode || 0;
+          // Apps Script often returns 200 even on error; still return body to debug
+          if (code >= 200 && code < 300)
+            return resolve({ ok: true, code, out });
+          resolve({ ok: false, code, out });
+        });
+      }
+    );
+
+    req.on("timeout", () => {
+      try {
+        req.destroy(new Error("timeout"));
+      } catch {}
+    });
+
+    req.on("error", (e) => reject(e));
+
+    req.write(data);
+    req.end();
+  });
+}
+
+// runtime state
+const tiktok = {
+  running: false,
+  startedAt: 0,
+  groupId: "",
+  macroId: "",
+  workers: new Map(), // deviceId -> { stop, stats }
+  queue: [],
+  flushing: false,
+  flushTimer: null,
+  lastFlushAt: 0,
+  pushedCount: 0,
+  failCount: 0,
+};
+
+function tiktokLog(msg, extra = {}) {
+  logger?.info("tiktok", { msg, ...extra });
+  safeSend("tiktok:log", { t: Date.now(), msg, ...extra });
+}
+
+// queue persistence
+function loadQueueFromDisk() {
+  try {
+    const p = TIKTOK_QUEUE_FILE();
+    if (!fs.existsSync(p)) return [];
+    const raw = fs.readFileSync(p, "utf8");
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveQueueToDisk(arr) {
+  try {
+    const p = TIKTOK_QUEUE_FILE();
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, JSON.stringify(arr, null, 2), "utf8");
+  } catch {}
+}
+
+function enqueueLink(item) {
+  if (!item?.url) return;
+  tiktok.queue.push(item);
+  saveQueueToDisk(tiktok.queue);
+}
+
+async function flushQueueIfNeeded(force = false) {
+  if (tiktok.flushing) return;
+  if (!tiktok.running && !force) return;
+
+  const cfg = tiktokConfig;
+  const qlen = tiktok.queue.length;
+
+  const dueByCount = qlen >= (Number(cfg.batchSize) || 15);
+  const dueByTime =
+    qlen > 0 && Date.now() - (tiktok.lastFlushAt || 0) >= cfg.flushEveryMs;
+
+  if (!force && !dueByCount && !dueByTime) return;
+  if (qlen === 0) return;
+
+  tiktok.flushing = true;
+  try {
+    const batchSize = Math.max(1, Number(cfg.batchSize) || 15);
+    const batch = tiktok.queue.slice(0, batchSize);
+
+    // POST each item (Apps Script appendRow). Bạn có thể đổi sang gửi array nếu muốn tối ưu.
+    for (const it of batch) {
+      const body = {
+        token: cfg.token,
+        groupId: it.groupId,
+        deviceId: it.deviceId,
+        url: it.url,
+        ts: it.tsClientMs || it.ts || Date.now(),
+        meta: {
+          ...(it.meta || {}),
+          hash: it.hash || sha1(it.url),
+          receivedBy: "android-forge",
+        },
+      };
+
+      let ok = false;
+      try {
+        const r = await postJson(cfg.endpointUrl, body, cfg.httpTimeoutMs);
+        ok = !!r.ok;
+        if (!ok) {
+          tiktok.failCount++;
+          tiktokLog("push:fail", {
+            deviceId: it.deviceId,
+            code: r.code,
+            out: String(r.out || "").slice(0, 300),
+          });
+        }
+      } catch (e) {
+        tiktok.failCount++;
+        tiktokLog("push:error", {
+          deviceId: it.deviceId,
+          err: String(e?.message || e || ""),
+        });
+        ok = false;
+      }
+
+      if (ok) {
+        tiktok.pushedCount++;
+        // remove 1 from front (exact item)
+        tiktok.queue.shift();
+        saveQueueToDisk(tiktok.queue);
+      } else {
+        // stop flushing on first failure to avoid hammering
+        break;
+      }
+    }
+
+    tiktok.lastFlushAt = Date.now();
+  } finally {
+    tiktok.flushing = false;
+    safeSend("tiktok:status", buildTikTokStatus());
+  }
+}
+
+function buildTikTokStatus() {
+  const devices = [];
+  for (const [deviceId, w] of tiktok.workers.entries()) {
+    devices.push({ deviceId, ...w.stats });
+  }
+  return {
+    running: tiktok.running,
+    startedAt: tiktok.startedAt,
+    groupId: tiktok.groupId,
+    macroId: tiktok.macroId,
+    queueSize: tiktok.queue.length,
+    pushedCount: tiktok.pushedCount,
+    failCount: tiktok.failCount,
+    lastFlushAt: tiktok.lastFlushAt,
+    devices,
+    config: { ...tiktokConfig, token: "***" },
+  };
+}
+
+function startFlushTimer() {
+  stopFlushTimer();
+  tiktok.flushTimer = setInterval(
+    () => {
+      flushQueueIfNeeded(false).catch(() => {});
+    },
+    Math.max(1500, Number(tiktokConfig.flushEveryMs) || 15000)
+  );
+}
+
+function stopFlushTimer() {
+  if (tiktok.flushTimer) {
+    clearInterval(tiktok.flushTimer);
+    tiktok.flushTimer = null;
+  }
+}
+
+async function swipeNext(ctx) {
+  const snap = ctx.snapshot?.() || {};
+  const res = snap.resolution || {};
+  const w = res.width || 1080;
+  const h = res.height || 1920;
+  const x = Math.round(w * 0.5);
+  const y1 = Math.round(h * 0.75);
+  const y2 = Math.round(h * 0.25);
+  await input.swipe(ctx.deviceId, x, y1, x, y2, 220);
+}
+
+async function isLiveScreen(deviceId, cfg) {
+  const kws = Array.isArray(cfg.liveKeywords) ? cfg.liveKeywords : [];
+  for (const kw of kws) {
+    const r = await agentFindText(deviceId, kw);
+    if (r?.found) return true;
+  }
+  return false;
+}
+
+async function runTikTokWorker(deviceId, groupId, macroId) {
+  const ctx = registry.get(deviceId);
+  if (!ctx) return;
+
+  const state = tiktok.workers.get(deviceId);
+  if (!state) return;
+
+  state.stats = state.stats || {};
+  state.stats.deviceId = deviceId;
+  state.stats.lastAt = 0;
+  state.stats.ok = 0;
+  state.stats.fail = 0;
+  state.stats.liveSkip = 0;
+  state.stats.liveConsecutive = 0;
+  state.stats.lastUrl = "";
+  state.stats.lastErr = "";
+  state.stats.shareFailStreak = 0;
+
+  // const macro = loadMacroByIdFromStore(macroId);
+
+  tiktokLog("worker:start", { deviceId, groupId, macroId });
+
+  while (tiktok.running && !state.stop) {
+    try {
+      const c = registry.get(deviceId);
+      if (!c || c.state !== "ONLINE") {
+        state.stats.lastErr = "offline";
+        await sleep(600);
+        continue;
+      }
+
+      const snap = c.snapshot?.() || {};
+      if (!snap.agentReady) {
+        state.stats.lastErr = "agent_not_ready";
+        await sleep(650);
+        continue;
+      }
+
+      // LIVE detect
+      const live = await isLiveScreen(deviceId, tiktokConfig);
+      if (live) {
+        state.stats.liveSkip++;
+        state.stats.liveConsecutive++;
+
+        // swipe away live
+        await c.enqueue(async () => {
+          await swipeNext(c);
+        });
+
+        // if live stuck -> try back/home
+        if (state.stats.liveConsecutive >= tiktokConfig.liveMaxConsecutive) {
+          tiktokLog("live:stuck", { deviceId, n: state.stats.liveConsecutive });
+          await c.enqueue(async () => {
+            try {
+              await input.back(deviceId);
+              await sleep(200);
+              await input.back(deviceId);
+              await sleep(200);
+              await swipeNext(c);
+            } catch {}
+          });
+          state.stats.liveConsecutive = 0;
+        }
+
+        state.stats.lastAt = Date.now();
+        safeSend("tiktok:status", buildTikTokStatus());
+        await sleep(Math.max(80, tiktokConfig.loopDelayMs));
+        continue;
+      }
+
+      // reset live streak
+      state.stats.liveConsecutive = 0;
+
+      // baseline clipboard
+      let baseline = "";
+      try {
+        baseline = await agentClipboardGet(deviceId);
+      } catch (e) {
+        state.stats.lastErr = "clipboard_get_failed";
+        await sleep(500);
+        continue;
+      }
+
+      // run macro share->copy
+      // 1) chạy macro: CHỈ mở share sheet (không tap copy link, không swipe)
+      // mở share sheet theo Accessibility (ổn định, không phụ thuộc tọa độ macro)
+      const opened = await openShareSheet(c);
+      tiktokLog("share:open", { deviceId, opened });
+
+      if (!opened) {
+        state.stats.fail++;
+        state.stats.lastErr = "share_not_opened";
+        state.stats.shareFailStreak = (state.stats.shareFailStreak || 0) + 1;
+
+        // thoát overlay nếu bấm nhầm
+        try {
+          await input.back(deviceId);
+        } catch {}
+        await sleep(220);
+
+        // ❗ KHÔNG swipe ngay -> tránh skip hàng loạt video
+        // chỉ swipe khi fail liên tiếp quá 3 lần
+        if (state.stats.shareFailStreak >= 3) {
+          state.stats.shareFailStreak = 0;
+          if (tiktokConfig.swipeAfterEach) {
+            await c.enqueue(async () => {
+              await swipeNext(c);
+            });
+          }
+        } else {
+          // thử lại trên cùng video
+          await sleep(350);
+        }
+
+        state.stats.lastAt = Date.now();
+        safeSend("tiktok:status", buildTikTokStatus());
+        await sleep(Math.max(80, tiktokConfig.loopDelayMs));
+        continue;
+      } else {
+        // mở được share thì reset streak
+        state.stats.shareFailStreak = 0;
+      }
+
+      // 2) click "Sao chép liên kết" bằng Accessibility text (không phụ thuộc vị trí)
+      let clicked = false;
+      try {
+        clicked = await clickCopyLinkOnShareSheet(c);
+        tiktokLog("copybtn:result", { deviceId, clicked });
+      } catch (e) {
+        clicked = false;
+      }
+
+      // 3) confirm clipboard changed + tiktok url
+      let url = "";
+      try {
+        url = await pollClipboardForTikTokUrl(deviceId, baseline, tiktokConfig);
+      } catch (e) {
+        url = "";
+      }
+
+      // 4) đóng share sheet nếu còn đang mở (tránh swipe bị scroll sheet)
+      try {
+        const s1 = await agentFindText(deviceId, "Gửi đến");
+        const s2 = await agentFindText(deviceId, "Send to");
+        if (s1?.found || s2?.found) {
+          await input.back(deviceId);
+          await sleep(120);
+        }
+      } catch {}
+
+      if (url && isTikTokUrl(url)) {
+        const item = {
+          groupId,
+          deviceId,
+          url,
+          tsClientMs: Date.now(),
+          hash: sha1(url),
+          meta: {
+            note: "TikTokHarvest",
+          },
+        };
+
+        enqueueLink(item);
+        state.stats.ok++;
+        state.stats.lastUrl = url;
+        state.stats.lastErr = "";
+        tiktokLog("copy:ok", { deviceId, url: url.slice(0, 120) });
+
+        // flush maybe
+        await flushQueueIfNeeded(false);
+      } else {
+        state.stats.fail++;
+        state.stats.lastErr = "copy_not_confirmed";
+        tiktokLog("copy:fail", { deviceId });
+
+        // attempt to close share sheet if stuck
+        await c.enqueue(async () => {
+          try {
+            await input.back(deviceId);
+          } catch {}
+        });
+      }
+
+      // swipe next
+      if (tiktokConfig.swipeAfterEach) {
+        await c.enqueue(async () => {
+          await swipeNext(c);
+        });
+      }
+
+      state.stats.lastAt = Date.now();
+      safeSend("tiktok:status", buildTikTokStatus());
+
+      await sleep(Math.max(40, tiktokConfig.loopDelayMs));
+    } catch (e) {
+      state.stats.fail++;
+      state.stats.lastErr = String(e?.message || e || "");
+      tiktokLog("worker:error", {
+        deviceId,
+        err: state.stats.lastErr.slice(0, 200),
+      });
+      safeSend("tiktok:status", buildTikTokStatus());
+      await sleep(650);
+    }
+  }
+
+  tiktokLog("worker:stop", { deviceId });
+}
+
+async function tiktokStartRuntime({ groupId, macroId, configPatch }) {
+  // stop existing
+  await tiktokStopRuntime();
+
+  // patch config (optional)
+  if (configPatch && typeof configPatch === "object") {
+    tiktokConfig = { ...tiktokConfig, ...configPatch };
+    setLayoutConfig({ tiktokConfig }); // persist + sanitize
+  }
+
+  const gid = String(groupId || tiktokConfig.groupId || "").trim();
+  const mid = String(macroId || tiktokConfig.macroId || "").trim();
+  if (!gid) throw new Error("groupId required");
+  // if (!mid) throw new Error("macroId required");
+
+  const g = groupManager.get(gid);
+  if (!g) throw new Error(`group not found: ${gid}`);
+
+  const ids = Array.from(g.devices || []);
+  if (!ids.length) throw new Error("group is empty");
+
+  // queue load
+  tiktok.queue = loadQueueFromDisk();
+
+  tiktok.running = true;
+  tiktok.startedAt = Date.now();
+  tiktok.groupId = gid;
+  tiktok.macroId = mid;
+
+  // persist chosen ids
+  tiktokConfig.groupId = gid;
+  tiktokConfig.macroId = mid;
+  setLayoutConfig({ tiktokConfig });
+
+  // workers
+  tiktok.workers.clear();
+  for (const did of ids) {
+    tiktok.workers.set(did, { stop: false, stats: {} });
+  }
+
+  startFlushTimer();
+  safeSend("tiktok:status", buildTikTokStatus());
+  tiktokLog("harvest:start", {
+    groupId: gid,
+    macroId: mid,
+    devices: ids.length,
+  });
+
+  // run in background (still in same process)
+  for (const did of ids) {
+    runTikTokWorker(did, gid, mid).catch(() => {});
+    await sleep(120);
+  }
+}
+
+async function tiktokStopRuntime() {
+  if (!tiktok.running && tiktok.workers.size === 0) {
+    stopFlushTimer();
+    return;
+  }
+
+  tiktok.running = false;
+  for (const [_, w] of tiktok.workers.entries()) {
+    w.stop = true;
+  }
+  stopFlushTimer();
+
+  // force flush remaining (best effort)
+  try {
+    await flushQueueIfNeeded(true);
+  } catch {}
+
+  tiktokLog("harvest:stop", { queueLeft: tiktok.queue.length });
+  safeSend("tiktok:status", buildTikTokStatus());
+}
+
+// ===============================
+
 app.whenReady().then(() => {
   // init window first for log streaming
   mainWindow = createWindow();
@@ -557,7 +1445,6 @@ app.whenReady().then(() => {
       saved.forceResizeOnApply ?? layoutConfig.forceResizeOnApply
     );
 
-    // ✅ Core 5 load
     layoutConfig.autoStartEnabled = !!(
       saved.autoStartEnabled ?? layoutConfig.autoStartEnabled
     );
@@ -592,10 +1479,13 @@ app.whenReady().then(() => {
         else deviceAliases[k] = v;
       }
     }
+
+    if (saved.tiktokConfig && typeof saved.tiktokConfig === "object") {
+      tiktokConfig = { ...tiktokConfig, ...saved.tiktokConfig };
+    }
   }
 
   initGroupBroadcast();
-
   attachRegistryLoggingAndRecover();
 
   // start polling after listeners attached
@@ -608,7 +1498,6 @@ app.whenReady().then(() => {
 
     logger?.audit("scrcpy:closed", { deviceId, code, signal });
 
-    // ✅ Core 5: auto recover if closed unexpectedly & device still ONLINE
     if (layoutConfig.autoStartEnabled) {
       autoRecoverScrcpy(deviceId, "scrcpy_closed");
     }
@@ -651,6 +1540,7 @@ app.whenReady().then(() => {
       cols: layoutConfig.cols,
       rows: layoutConfig.rows,
       margin: layoutConfig.margin,
+      hasTikTok: !!tiktokConfig?.endpointUrl,
     });
     return getLayoutConfig();
   });
@@ -1054,6 +1944,9 @@ app.whenReady().then(() => {
     const ctx = ensureOnline(registry.get(deviceId));
     const macro = loadMacro(app.getPath("userData"), macroId);
 
+    const stepsLen = Array.isArray(macro?.steps) ? macro.steps.length : 0;
+    if (!stepsLen) throw new Error("Macro has no steps: " + macroId);
+
     if (runningMacroByDevice.has(deviceId)) {
       throw new Error("Macro already running on this device. Stop it first.");
     }
@@ -1067,20 +1960,32 @@ app.whenReady().then(() => {
     };
     runningMacroByDevice.set(deviceId, state);
 
-    sendMacroState(deviceId, { running: true, macroId });
+    const lc = parseLoopCount(options?.loop);
+    const loopCountForUi = lc.infinite ? 0 : lc.total;
+
+    sendMacroState(deviceId, {
+      running: true,
+      macroId,
+      loopCount: loopCountForUi,
+      loopIndex: 1,
+    });
 
     return ctx.enqueue(async () => {
       try {
-        const loop = Number(options?.loop ?? 1);
-        const loops = Number.isFinite(loop) ? Math.max(1, Math.floor(loop)) : 1;
-
-        for (let li = 0; li < loops; li++) {
+        for (let li = 0; lc.infinite || li < lc.total; li++) {
           if (state.stop) break;
+
+          const loopIndexForUi = li + 1;
 
           await runMacroOnDevice(ctx, macro, options || {}, {
             shouldStop: () => state.stop,
             token: state.token,
-            onProgress: (p) => sendMacroProgress(deviceId, p),
+            onProgress: (p) =>
+              sendMacroProgress(deviceId, {
+                ...p,
+                loopIndex: loopIndexForUi,
+                loopCount: loopCountForUi,
+              }),
           });
         }
 
@@ -1239,6 +2144,37 @@ app.whenReady().then(() => {
     return groupBroadcast.snapshot(groupId);
   });
 
+  // ======================
+  // TikTok Harvest IPC (NEW)
+  // ======================
+  ipcMain.handle("tiktok:status", async () => {
+    return buildTikTokStatus();
+  });
+
+  ipcMain.handle("tiktok:start", async (_, payload = {}) => {
+    const groupId = String(
+      payload.groupId || tiktokConfig.groupId || ""
+    ).trim();
+    const macroId = String(
+      payload.macroId || tiktokConfig.macroId || ""
+    ).trim();
+    const configPatch =
+      payload.config && typeof payload.config === "object"
+        ? payload.config
+        : {};
+
+    logger?.audit("tiktok:start", { groupId, macroId });
+
+    await tiktokStartRuntime({ groupId, macroId, configPatch });
+    return buildTikTokStatus();
+  });
+
+  ipcMain.handle("tiktok:stop", async () => {
+    logger?.audit("tiktok:stop", {});
+    await tiktokStopRuntime();
+    return buildTikTokStatus();
+  });
+
   app.on("before-quit", () => {
     persistSettings();
     logger?.info("app:beforeQuit", {});
@@ -1257,6 +2193,7 @@ app.whenReady().then(() => {
   logger?.info("app:ready", {
     autoStartEnabled: layoutConfig.autoStartEnabled,
     autoWakeOnRecover: layoutConfig.autoWakeOnRecover,
+    tiktokEndpoint: !!tiktokConfig.endpointUrl,
   });
 });
 

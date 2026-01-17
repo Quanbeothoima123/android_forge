@@ -39,6 +39,26 @@ function pctToPx(pct01, axisMax) {
   return Math.max(0, Math.min(axisMax - 1, Math.round(pct01 * axisMax)));
 }
 
+function parseLoopCount(loopRaw) {
+  // Convention: loop <= 0 => infinite (UI shows ∞)
+  const s = typeof loopRaw === "string" ? loopRaw.trim() : "";
+  if (s) {
+    if (s === "∞" || /^inf(inite)?$/i.test(s))
+      return { infinite: true, total: 0 };
+    const n = Number(s);
+    if (Number.isFinite(n)) {
+      if (n <= 0) return { infinite: true, total: 0 };
+      return { infinite: false, total: Math.max(1, Math.floor(n)) };
+    }
+    return { infinite: false, total: 1 };
+  }
+
+  const n = Number(loopRaw);
+  if (!Number.isFinite(n)) return { infinite: false, total: 1 };
+  if (n <= 0) return { infinite: true, total: 0 };
+  return { infinite: false, total: Math.max(1, Math.floor(n)) };
+}
+
 class GroupBroadcast {
   constructor({
     registry,
@@ -228,6 +248,9 @@ class GroupBroadcast {
     const macro = this.loadMacroById(macroId);
     if (!macro) throw new Error("Macro not found: " + macroId);
 
+    const lc = parseLoopCount(options?.loop);
+    const loopCountForUi = lc.infinite ? 0 : lc.total;
+
     const runId = Date.now();
     const states = new Map();
     this.runningByGroup.set(groupId, { runId, states });
@@ -272,6 +295,8 @@ class GroupBroadcast {
       this.sendMacroState(deviceId, {
         running: true,
         macroId: String(macroId),
+        loopCount: loopCountForUi,
+        loopIndex: 1,
       });
 
       ctx
@@ -291,13 +316,24 @@ class GroupBroadcast {
           if (shouldStop()) return { ok: false, stoppedBeforeRun: true };
 
           try {
-            await runMacroOnDevice(ctx, macro, options || {}, {
-              shouldStop,
-              token: runId,
-              onProgress: (p) => {
-                this.sendMacroProgress(deviceId, { deviceId, ...p });
-              },
-            });
+            for (let li = 0; lc.infinite || li < lc.total; li++) {
+              if (shouldStop()) break;
+
+              const loopIndexForUi = li + 1;
+
+              await runMacroOnDevice(ctx, macro, options || {}, {
+                shouldStop,
+                token: runId,
+                onProgress: (p) => {
+                  this.sendMacroProgress(deviceId, {
+                    deviceId,
+                    ...p,
+                    loopIndex: loopIndexForUi,
+                    loopCount: loopCountForUi,
+                  });
+                },
+              });
+            }
 
             return { ok: true };
           } finally {

@@ -16,6 +16,25 @@ function fmtRes(d) {
   return "?";
 }
 
+// ===== Loop parse (0 = infinite) =====
+function parseLoopInput(raw) {
+  const s = String(raw ?? "").trim();
+  if (!s) return 1;
+
+  if (s === "∞" || /^inf(inite)?$/i.test(s)) return 0;
+
+  const n = Number(s);
+  if (!Number.isFinite(n)) return 1;
+
+  if (n <= 0) return 0;
+  return Math.max(1, Math.floor(n));
+}
+
+function fmtLoopCount(loopCount) {
+  if (loopCount === 0) return "∞";
+  return String(loopCount ?? "?");
+}
+
 // ===== selection =====
 let selectedDeviceId = "";
 const devicesById = new Map();
@@ -82,7 +101,14 @@ function renderMacroStatus(deviceId) {
   const idx = st.stepIndex ?? 0;
   const cnt = st.stepCount ?? "?";
   const type = st.stepType || "";
-  el.textContent = `Macro: RUNNING • step ${idx}/${cnt} ${type ? `• ${type}` : ""}`;
+
+  const li = st.loopIndex ?? 0;
+  const lc = st.loopCount; // 0 => infinite
+  const loopPart = lc != null ? ` • loop ${li || 1}/${fmtLoopCount(lc)}` : "";
+
+  el.textContent = `Macro: RUNNING${loopPart} • step ${idx}/${cnt}${
+    type ? ` • ${type}` : ""
+  }`;
   setMacroUiEnabled(false);
 }
 
@@ -703,7 +729,9 @@ $("applyLayoutBtn").addEventListener("click", () =>
     const forceResize = !!$("forceResizeChk").checked;
     const r = await window.forgeAPI.scrcpyApplyLayout({ forceResize });
     logLocal(
-      `Apply layout: ${r?.count ?? "?"} windows (forceResize=${r?.forceResize ?? forceResize})`
+      `Apply layout: ${r?.count ?? "?"} windows (forceResize=${
+        r?.forceResize ?? forceResize
+      })`
     );
   })
 );
@@ -918,7 +946,7 @@ $("macroPlayBtn").addEventListener("click", () =>
     const macroId = $("macroList").value;
     if (!macroId) throw new Error("Select a macro");
 
-    const loop = Number($("macroLoop").value || 1);
+    const loop = parseLoopInput($("macroLoop").value); // 0 => infinite
     const speed = Number($("macroSpeed").value || 1.0);
     const xyJitterPct = Number($("macroJitterXY").value || 0.0);
     const delayJitterPct = Number($("macroJitterDelay").value || 0.0);
@@ -926,10 +954,17 @@ $("macroPlayBtn").addEventListener("click", () =>
     macroRuntimeByDevice.set(id, {
       running: true,
       macroId,
+      loopIndex: 1,
+      loopCount: loop,
       stepIndex: 0,
       stepCount: "?",
+      stepType: "",
     });
     renderMacroStatus(id);
+
+    logLocal(
+      `Play macro ${macroId} on ${id} (loop=${loop === 0 ? "∞" : loop})`
+    );
 
     await window.forgeAPI.macroPlay(id, macroId, {
       loop,
@@ -937,7 +972,6 @@ $("macroPlayBtn").addEventListener("click", () =>
       xyJitterPct,
       delayJitterPct,
     });
-    logLocal(`Play macro ${macroId} on ${id}`);
   })
 );
 
@@ -956,7 +990,7 @@ $("groupMacroPlayBtn").addEventListener("click", () =>
     const macroId = $("macroList").value;
     if (!macroId) throw new Error("Select a macro");
 
-    const loop = Number($("macroLoop").value || 1);
+    const loop = parseLoopInput($("macroLoop").value); // 0 => infinite
     const speed = Number($("macroSpeed").value || 1.0);
     const xyJitterPct = Number($("macroJitterXY").value || 0.0);
     const delayJitterPct = Number($("macroJitterDelay").value || 0.0);
@@ -974,7 +1008,9 @@ $("groupMacroPlayBtn").addEventListener("click", () =>
     );
 
     logLocal(
-      `Group macro started: group=${gid} macro=${macroId} started=${r?.started?.length || 0}`
+      `Group macro started: group=${gid} macro=${macroId} loop=${
+        loop === 0 ? "∞" : loop
+      } started=${r?.started?.length || 0}`
     );
   })
 );
@@ -1000,7 +1036,7 @@ $("groupMacroStopSelectedBtn").addEventListener("click", () =>
 
 // macro state/progress events
 window.forgeAPI.onMacroState((p) => {
-  const { deviceId, running, macroId } = p || {};
+  const { deviceId, running, macroId, loopIndex, loopCount } = p || {};
   if (!deviceId) return;
 
   const prevRunning = !!macroPrevRunningByDevice.get(deviceId);
@@ -1022,13 +1058,16 @@ window.forgeAPI.onMacroState((p) => {
     stepIndex: nextRunning ? (cur.stepIndex ?? 0) : 0,
     stepCount: nextRunning ? (cur.stepCount ?? "?") : 0,
     stepType: nextRunning ? (cur.stepType ?? "") : "",
+    loopIndex: nextRunning ? (loopIndex ?? cur.loopIndex ?? 1) : 0,
+    loopCount: nextRunning ? (loopCount ?? cur.loopCount) : cur.loopCount,
   });
 
   if (deviceId === selectedDeviceId) renderMacroStatus(deviceId);
 });
 
 window.forgeAPI.onMacroProgress((p) => {
-  const { deviceId, stepIndex, stepCount, stepType } = p || {};
+  const { deviceId, stepIndex, stepCount, stepType, loopIndex, loopCount } =
+    p || {};
   if (!deviceId) return;
   const cur = macroRuntimeByDevice.get(deviceId) || {};
   macroRuntimeByDevice.set(deviceId, {
@@ -1037,6 +1076,8 @@ window.forgeAPI.onMacroProgress((p) => {
     stepIndex,
     stepCount,
     stepType,
+    ...(loopIndex != null ? { loopIndex } : {}),
+    ...(loopCount != null ? { loopCount } : {}),
   });
   if (deviceId === selectedDeviceId) renderMacroStatus(deviceId);
 });

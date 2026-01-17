@@ -102,10 +102,23 @@
             margin-top: 4px;
         }
 
+        /* ✅ QUICK CONTROLS / GROUP QUICK: làm nhỏ + không bị giãn quá rộng */
         .gridBtns {
             display: grid;
             grid-template-columns: repeat(4, minmax(0, 1fr));
-            gap: 8px;
+            gap: 6px;
+            /* was 8 */
+            max-width: 640px;
+            /* ✅ cap width so buttons don't stretch */
+            justify-content: start;
+            /* ✅ keep left-aligned inside big panel */
+        }
+
+        .gridBtns button {
+            padding: 4px 8px;
+            /* ✅ smaller buttons */
+            font-size: 12px;
+            line-height: 1.15;
         }
 
         .sectionTitle {
@@ -181,11 +194,51 @@
         .gTitle {
             font-weight: 700;
         }
+
+        /* TikTok harvest box */
+        #tiktokLog {
+            max-height: 180px;
+            overflow: auto;
+            border: 1px solid #eee;
+            padding: 8px;
+            border-radius: 8px;
+            background: #fff;
+        }
+
+        #tiktokStatusBox {
+            border: 1px solid #eee;
+            padding: 8px;
+            border-radius: 8px;
+            background: #fff;
+        }
+
+        /* ✅ TikTok Harvest: 2 cột không bị giãn xa nhau */
+        .twoCol {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            max-width: 900px;
+            /* ✅ cap width so 2 columns stay close */
+            justify-content: start;
+            /* ✅ left align in wide windows */
+        }
+
+        @media (max-width: 980px) {
+            .twoCol {
+                grid-template-columns: 1fr;
+                /* ✅ stack on smaller window */
+                max-width: 100%;
+            }
+        }
+
+        .w360 {
+            width: 360px;
+        }
     </style>
 </head>
 
 <body>
-    <h1>Android Forge — Control Panel (No Electron Streaming)</h1>
+    <h1>Android Forge — Control Panel (No Electron Streaming) <span class="pill">UI build: loop∞</span></h1>
 
     <div class="row">
         <button id="startAllBtn">Start All scrcpy</button>
@@ -261,7 +314,6 @@
             <div id="groupDevicesPanel" class="muted small">(chọn group để xem danh sách thiết bị)</div>
 
             <div class="hr"></div>
-
             <div id="devices" class="muted">(loading...)</div>
         </div>
 
@@ -303,7 +355,6 @@
                 </label>
 
                 <button id="applyLayoutBtn">Apply layout</button>
-
                 <span class="pill">Config sẽ tự lưu (settings.json)</span>
             </div>
 
@@ -361,7 +412,6 @@
             <div class="inline small">
                 <button id="macroRecStartBtn">Start Record</button>
                 <button id="macroRecStopBtn">Stop Record</button>
-
                 <span class="pill">V2: record bằng click/drag trực tiếp trên cửa sổ scrcpy
                     (forge:&lt;deviceId&gt;)</span>
             </div>
@@ -393,7 +443,8 @@
                 <select id="macroList" class="w220"></select>
                 <button id="macroReloadBtn">Reload</button>
 
-                <input id="macroLoop" class="w90" placeholder="loop" value="1" />
+                <span class="muted">Loop (0=∞):</span>
+                <input id="macroLoop" class="w90" placeholder="0=∞" value="1" />
                 <button id="macroPlayBtn">Play on selected</button>
                 <button id="macroStopBtn">Stop</button>
             </div>
@@ -422,12 +473,84 @@
                 <input id="macroSpeed" class="w90" value="1.0" />
             </div>
 
+            <div class="hr"></div>
+            <div class="sectionTitle">TikTok Harvest (NEW)</div>
+
+            <div class="muted small" style="margin-bottom:6px;">
+                Chạy theo <b>Group</b> + dùng <b>macro copy link</b>. Core sẽ:
+                detect LIVE → swipe bỏ qua • confirm clipboard có link TikTok → push Google Sheet (batch).
+            </div>
+
+            <div class="twoCol small">
+                <div class="inline">
+                    <span class="muted">Group:</span>
+                    <select id="tiktokGroupSel" class="w260"></select>
+                    <button id="tiktokReloadGroupsBtn">Reload</button>
+                </div>
+
+                <div class="inline">
+                    <span class="muted">Macro:</span>
+                    <select id="tiktokMacroSel" class="w260"></select>
+                    <button id="tiktokReloadMacrosBtn">Reload</button>
+                </div>
+            </div>
+
+            <div class="twoCol small" style="margin-top:8px;">
+                <div class="inline">
+                    <span class="muted">Endpoint:</span>
+                    <input id="tiktokEndpoint" class="w360" placeholder="https://script.google.com/macros/s/.../exec" />
+                </div>
+
+                <div class="inline">
+                    <span class="muted">Token:</span>
+                    <input id="tiktokToken" class="w260" placeholder="secret..." />
+                    <span class="muted">GroupId:</span>
+                    <input id="tiktokGroupId" class="w120" placeholder="Farm_HCM" />
+                </div>
+            </div>
+
+            <div class="twoCol small" style="margin-top:8px;">
+                <div class="inline">
+                    <span class="muted">BatchSize:</span>
+                    <input id="tiktokBatchSize" class="w90" value="15" />
+                    <span class="muted">Flush(ms):</span>
+                    <input id="tiktokFlushMs" class="w120" value="15000" />
+                    <span class="muted">HTTP(ms):</span>
+                    <input id="tiktokHttpMs" class="w120" value="12000" />
+                </div>
+
+                <div class="inline">
+                    <span class="muted">ClipPoll(ms):</span>
+                    <input id="tiktokClipPollEvery" class="w90" value="260" />
+                    <span class="muted">ClipTimeout(ms):</span>
+                    <input id="tiktokClipPollTimeout" class="w120" value="3500" />
+                    <span class="muted">LiveStuck:</span>
+                    <input id="tiktokLiveMax" class="w90" value="3" />
+                </div>
+            </div>
+
+            <div class="inline small" style="margin-top:8px;">
+                <button id="tiktokSaveCfgBtn">Save Config</button>
+                <button id="tiktokStartBtn">Start Harvest</button>
+                <button id="tiktokStopBtn">Stop</button>
+                <span id="tiktokRunBadge" class="badge">RUNNING: ?</span>
+                <span class="pill">settings.json tự lưu</span>
+            </div>
+
+            <div id="tiktokStatusBox" class="muted small" style="margin-top:8px;">
+                (TikTok Harvest status sẽ hiện ở đây)
+            </div>
+
+            <div class="sectionTitle">TikTok Harvest Log</div>
+            <div id="tiktokLog" class="muted small">(log)</div>
+
             <div class="sectionTitle">Log</div>
             <div id="log" class="muted">(log sẽ hiện ở đây)</div>
         </div>
     </div>
 
     <script src="./renderer.js"></script>
+    <script src="./tiktok_ui.js"></script>
 </body>
 
 </html>

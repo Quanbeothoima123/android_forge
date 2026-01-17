@@ -136,4 +136,19 @@ contextBridge.exposeInMainWorld("forgeAPI", {
     ipcRenderer.invoke("group:macroStopDevice", { groupId, deviceId }),
   groupMacroSnapshot: (groupId) =>
     ipcRenderer.invoke("group:macroSnapshot", { groupId }),
+
+  // ======================
+  // ✅ TikTok Harvest (NEW)
+  // ======================
+  tiktokStatus: () => ipcRenderer.invoke("tiktok:status"),
+  tiktokStart: (groupId, macroId, config) =>
+    ipcRenderer.invoke("tiktok:start", { groupId, macroId, config }),
+  tiktokStop: () => ipcRenderer.invoke("tiktok:stop"),
+
+  onTikTokStatus: (cb) => {
+    ipcRenderer.on("tiktok:status", (_, payload) => cb(payload));
+  },
+  onTikTokLog: (cb) => {
+    ipcRenderer.on("tiktok:log", (_, payload) => cb(payload));
+  },
 });

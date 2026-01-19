@@ -1,5 +1,6 @@
 // src/main.js
-const { app, BrowserWindow, ipcMain } = require("electron");
+const { app, BrowserWindow, ipcMain, clipboard } = require("electron");
+
 const path = require("path");
 const fs = require("fs");
 const { randomUUID, createHash } = require("crypto");
@@ -203,10 +204,16 @@ let tiktokConfig = {
 
   // poll clipboard
   clipboardPollEveryMs: 260,
-  clipboardPollTimeoutMs: 3500,
+  clipboardPollTimeoutMs: 8000,
 
   // general loop delay
   loopDelayMs: 180,
+
+  copyAttemptsPerVideo: 1,
+
+  swipeOnFailAfter: 1,
+
+  liveMinHits: 2,
 };
 
 // ========= Groups (persisted) =========
@@ -316,28 +323,41 @@ function setLayoutConfig(patch = {}) {
     tiktokConfig.batchSize = Math.max(1, Number(tiktokConfig.batchSize) || 15);
     tiktokConfig.flushEveryMs = Math.max(
       2000,
-      Number(tiktokConfig.flushEveryMs) || 15000
+      Number(tiktokConfig.flushEveryMs) || 15000,
     );
     tiktokConfig.httpTimeoutMs = Math.max(
       2000,
-      Number(tiktokConfig.httpTimeoutMs) || 12000
+      Number(tiktokConfig.httpTimeoutMs) || 12000,
     );
     tiktokConfig.clipboardPollEveryMs = Math.max(
       120,
-      Number(tiktokConfig.clipboardPollEveryMs) || 260
+      Number(tiktokConfig.clipboardPollEveryMs) || 260,
     );
     tiktokConfig.clipboardPollTimeoutMs = Math.max(
       800,
-      Number(tiktokConfig.clipboardPollTimeoutMs) || 3500
+      Number(tiktokConfig.clipboardPollTimeoutMs) || 3500,
     );
     tiktokConfig.liveMaxConsecutive = Math.max(
       1,
-      Number(tiktokConfig.liveMaxConsecutive) || 3
+      Number(tiktokConfig.liveMaxConsecutive) || 3,
     );
     tiktokConfig.loopDelayMs = Math.max(
       0,
-      Number(tiktokConfig.loopDelayMs) || 180
+      Number(tiktokConfig.loopDelayMs) || 180,
     );
+    tiktokConfig.copyAttemptsPerVideo = Math.max(
+      1,
+      Number(tiktokConfig.copyAttemptsPerVideo) || 2,
+    );
+    tiktokConfig.swipeOnFailAfter = Math.max(
+      1,
+      Number(tiktokConfig.swipeOnFailAfter) || 2,
+    );
+    tiktokConfig.liveMinHits = Math.max(
+      1,
+      Number(tiktokConfig.liveMinHits) || 2,
+    );
+
     if (!Array.isArray(tiktokConfig.liveKeywords))
       tiktokConfig.liveKeywords = [
         "Nhấn để xem LIVE",
@@ -528,7 +548,7 @@ async function autoRecoverScrcpy(deviceId, reason) {
 
     const { width, height, maxSize } = computeScrcpyCellAndMaxSize(
       snap,
-      layoutConfig.scalePct
+      layoutConfig.scalePct,
     );
 
     await scrcpy.start(deviceId, {
@@ -639,11 +659,52 @@ function nowIso() {
   return new Date().toISOString();
 }
 
-function isTikTokUrl(u) {
-  const s = String(u || "").trim();
-  if (!s) return false;
-  if (!/^https?:\/\//i.test(s)) return false;
-  return /tiktok\.com\//i.test(s);
+function hostClipboardGet() {
+  try {
+    return String(clipboard.readText() || "");
+  } catch {
+    return "";
+  }
+}
+
+// mutex để tránh 2 worker cùng lúc chờ clipboard
+let _clipMutex = Promise.resolve();
+async function withClipboardMutex(fn) {
+  const prev = _clipMutex;
+  let release;
+  _clipMutex = new Promise((r) => (release = r));
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
+function extractFirstHttpUrl(text) {
+  const s = String(text || "");
+  const m = s.match(/https?:\/\/[^\s]+/i);
+  if (!m) return "";
+  let u = m[0].trim();
+  // trim dấu câu hay dính cuối
+  u = u.replace(/[)\],.;]+$/g, "");
+  return u;
+}
+
+function extractTikTokUrl(text) {
+  const u = extractFirstHttpUrl(text);
+  if (!u) return "";
+  if (!/tiktok\.com\//i.test(u)) return "";
+  return u;
+}
+
+function isTikTokUrl(text) {
+  return !!extractTikTokUrl(text);
+}
+
+function maskUrl(u, max = 120) {
+  const s = String(u || "");
+  return s.length > max ? s.slice(0, max) + "..." : s;
 }
 
 function sha1(s) {
@@ -680,11 +741,62 @@ function parseOkJson(line) {
   }
 }
 
+// ✅ CLIPBOARD_GET có thể trả:
+//   - OK {"text":"..."}  (json)
+//   - OK <base64>        (base64)
+//   - OK https://...     (plain)
+function parseOkTextDual(line) {
+  const s = String(line || "");
+  if (!s.startsWith("OK")) return "";
+  const rest = s.slice(2).trim();
+  if (!rest) return "";
+
+  // 1) JSON: OK {"text":"..."} hoặc OK "..."
+  try {
+    const v = JSON.parse(rest);
+    if (typeof v === "string") return v;
+
+    if (v && typeof v === "object") {
+      for (const k of [
+        "text",
+        "value",
+        "clipboard",
+        "clip",
+        "data",
+        "content",
+      ]) {
+        if (v[k] != null) return String(v[k]);
+      }
+    }
+  } catch {}
+
+  // 2) Plain text (URL)
+  if (/^https?:\/\//i.test(rest)) return rest;
+
+  // 3) base64
+  if (/^[A-Za-z0-9+/=]+$/.test(rest) && rest.length >= 8) {
+    try {
+      const decoded = Buffer.from(rest, "base64").toString("utf8").trim();
+      if (decoded) return decoded;
+    } catch {}
+  }
+
+  return "";
+}
+
 async function agentClipboardGet(deviceId) {
   const r = await agentCallLine(deviceId, { type: "CLIPBOARD_GET" }, 1800);
   if (!r.ok) throw new Error(r.line || "ERR clipboard");
-  const obj = parseOkJson(r.line);
-  const text = obj?.text != null ? String(obj.text) : "";
+
+  const text = parseOkTextDual(r.line);
+
+  // DEBUG: nếu rỗng thì log raw để xem agent trả gì
+  if (!text) {
+    tiktokLog("clipboard:empty", {
+      deviceId,
+      line: String(r.line || "").slice(0, 160),
+    });
+  }
   return text;
 }
 
@@ -694,7 +806,7 @@ async function agentFindText(deviceId, query) {
   const r = await agentCallLine(
     deviceId,
     { type: "FIND_TEXT", query: q, ignoreCase: true, mode: "contains" },
-    2200
+    2200,
   );
   if (!r.ok) return { found: false, error: r.line || "" };
   const obj = parseOkJson(r.line);
@@ -709,7 +821,7 @@ async function agentClickText(deviceId, query) {
   const r = await agentCallLine(
     deviceId,
     { type: "CLICK_TEXT", query: q, ignoreCase: true, mode: "contains" },
-    2200
+    2200,
   );
   if (!r.ok) return { found: false, clicked: false, error: r.line || "" };
 
@@ -725,7 +837,7 @@ async function agentFindDesc(deviceId, query) {
   const r = await agentCallLine(
     deviceId,
     { type: "FIND_DESC", query: q, ignoreCase: true, mode: "contains" },
-    2200
+    2200,
   );
   if (!r.ok) return { found: false, error: r.line || "" };
 
@@ -740,7 +852,7 @@ async function agentClickDesc(deviceId, query) {
   const r = await agentCallLine(
     deviceId,
     { type: "CLICK_DESC", query: q, ignoreCase: true, mode: "contains" },
-    2200
+    2200,
   );
   if (!r.ok) return { found: false, clicked: false, error: r.line || "" };
 
@@ -755,7 +867,7 @@ async function agentClickId(deviceId, query) {
   const r = await agentCallLine(
     deviceId,
     { type: "CLICK_ID", query: q, ignoreCase: true, mode: "contains" },
-    2200
+    2200,
   );
   if (!r.ok) return { found: false, clicked: false, error: r.line || "" };
 
@@ -770,17 +882,177 @@ async function agentOpenShare(deviceId) {
   return { opened: !!obj?.opened, obj };
 }
 
-async function pollClipboardForTikTokUrl(deviceId, baseline, cfg) {
+async function waitClipboardTikTokUrl(deviceId, baselineRaw, cfg) {
   const every = Math.max(120, Number(cfg.clipboardPollEveryMs) || 260);
-  const timeout = Math.max(800, Number(cfg.clipboardPollTimeoutMs) || 3500);
+  const timeout = Math.max(800, Number(cfg.clipboardPollTimeoutMs) || 8000);
+
+  const baselineUrl = extractTikTokUrl(baselineRaw);
   const started = Date.now();
 
+  let tries = 0;
+  let lastRaw = "";
+  let lastUrl = "";
+
   while (Date.now() - started < timeout) {
-    const cur = await agentClipboardGet(deviceId);
-    if (cur && cur !== baseline && isTikTokUrl(cur)) return cur;
+    tries++;
+    lastRaw = await agentClipboardGet(deviceId);
+    lastUrl = extractTikTokUrl(lastRaw);
+
+    // chưa có url -> chờ tiếp
+    if (!lastUrl) {
+      await sleep(every);
+      continue;
+    }
+
+    // baseline không có url -> lấy luôn
+    if (!baselineUrl) {
+      return {
+        ok: true,
+        status: "ok",
+        url: lastUrl,
+        baselineUrl,
+        lastUrl,
+        tries,
+        elapsedMs: Date.now() - started,
+      };
+    }
+
+    // url đổi so với baseline -> success chuẩn
+    if (lastUrl !== baselineUrl) {
+      return {
+        ok: true,
+        status: "ok",
+        url: lastUrl,
+        baselineUrl,
+        lastUrl,
+        tries,
+        elapsedMs: Date.now() - started,
+      };
+    }
+
+    // vẫn giống baseline -> tiếp tục đợi (nhưng có ghi nhận lastUrl)
     await sleep(every);
   }
-  return "";
+
+  // timeout
+  if (lastUrl && baselineUrl && lastUrl === baselineUrl) {
+    return {
+      ok: true, // coi như "dup" để worker có thể swipe đi tiếp, tránh kẹt
+      status: "dup",
+      url: lastUrl,
+      baselineUrl,
+      lastUrl,
+      tries,
+      elapsedMs: Date.now() - started,
+      reason: "same_as_baseline_timeout",
+    };
+  }
+
+  return {
+    ok: false,
+    status: "timeout",
+    url: "",
+    baselineUrl,
+    lastUrl,
+    tries,
+    elapsedMs: Date.now() - started,
+    reason: lastUrl ? "no_change_or_not_tiktok_url" : "no_url_timeout",
+  };
+}
+
+async function waitClipboardTikTokUrlAny(
+  deviceId,
+  baselineAgentRaw,
+  baselineHostRaw,
+  cfg,
+) {
+  const every = Math.max(120, Number(cfg.clipboardPollEveryMs) || 260);
+  const timeout = Math.max(800, Number(cfg.clipboardPollTimeoutMs) || 8000);
+
+  const baselineAgentUrl = extractTikTokUrl(baselineAgentRaw);
+  const baselineHostUrl = extractTikTokUrl(baselineHostRaw);
+  const base = baselineAgentUrl || baselineHostUrl;
+
+  const started = Date.now();
+  let tries = 0;
+
+  let lastAgentUrl = "";
+  let lastHostUrl = "";
+  let lastPicked = "";
+
+  while (Date.now() - started < timeout) {
+    tries++;
+
+    // agent
+    try {
+      const aRaw = await agentClipboardGet(deviceId);
+      lastAgentUrl = extractTikTokUrl(aRaw);
+    } catch {}
+
+    // host
+    const hRaw = hostClipboardGet();
+    lastHostUrl = extractTikTokUrl(hRaw);
+
+    // prefer agent nếu có
+    lastPicked = lastAgentUrl || lastHostUrl;
+
+    if (lastPicked) {
+      // baseline rỗng => lấy luôn
+      if (!base) {
+        return {
+          ok: true,
+          status: "ok",
+          url: lastPicked,
+          tries,
+          elapsedMs: Date.now() - started,
+          source: lastAgentUrl ? "agent" : "host",
+        };
+      }
+
+      // baseline có => chỉ success nếu URL đổi
+      if (lastPicked !== base) {
+        return {
+          ok: true,
+          status: "ok",
+          url: lastPicked,
+          tries,
+          elapsedMs: Date.now() - started,
+          source: lastAgentUrl ? "agent" : "host",
+        };
+      }
+
+      // == baseline => tiếp tục đợi, KHÔNG return ngay
+    }
+
+    await sleep(every);
+  }
+
+  // timeout: nếu có URL nhưng không đổi => dup
+  if (lastPicked && base && lastPicked === base) {
+    return {
+      ok: true,
+      status: "dup",
+      url: lastPicked,
+      tries,
+      elapsedMs: Date.now() - started,
+      reason: "same_as_baseline_timeout",
+    };
+  }
+
+  return {
+    ok: false,
+    status: "timeout",
+    url: "",
+    tries,
+    elapsedMs: Date.now() - started,
+    reason: "no_url_timeout",
+  };
+}
+
+// giữ lại signature cũ cho các chỗ khác (nếu có)
+async function pollClipboardForTikTokUrl(deviceId, baseline, cfg) {
+  const r = await waitClipboardTikTokUrl(deviceId, baseline, cfg);
+  return r.url || "";
 }
 
 function _centerFromBounds(obj) {
@@ -794,7 +1066,17 @@ function _centerFromBounds(obj) {
 
 async function isShareSheetOpen(deviceId) {
   // Share sheet TikTok thường có "Gửi đến" (VN) hoặc "Send to" (EN)
-  const markers = ["Gửi đến", "Send to", "Sao chép liên kết", "Copy link"];
+  const markers = [
+    "Gửi đến",
+    "Gửi tới",
+    "Gửi cho",
+    "Send to",
+    "Sao chép liên kết",
+    "Copy link",
+    "Liên kết",
+    "Link",
+  ];
+
   for (const m of markers) {
     const r = await agentFindText(deviceId, m);
     if (r?.found) return true;
@@ -805,54 +1087,69 @@ async function isShareSheetOpen(deviceId) {
 async function openShareSheet(ctx) {
   const deviceId = ctx.deviceId;
 
-  if (await isShareSheetOpen(deviceId)) return true;
+  // 0) nếu đang mở sẵn
+  try {
+    if (await isShareSheetOpen(deviceId)) return true;
+  } catch {}
 
-  // ✅ ưu tiên OPEN_SHARE (node-scan) -> không phụ thuộc tọa độ icon Share
+  // 1) thử agent OPEN_SHARE
   try {
     const r = await agentOpenShare(deviceId);
-    if (r.opened) {
-      await sleep(220);
+    if (r?.opened) {
+      await sleep(280);
       if (await isShareSheetOpen(deviceId)) return true;
     }
   } catch {}
 
-  // Ưu tiên click theo contentDescription (Accessibility)
-  const descKeywords = ["Chia sẻ", "Share"];
-  for (let round = 1; round <= 2; round++) {
-    for (const kw of descKeywords) {
-      const r = await agentClickDesc(deviceId, kw);
+  // 2) fallback TAP theo toạ độ icon share (quét nhiều y hơn)
+  try {
+    const snap =
+      typeof ctx.snapshot === "function" ? ctx.snapshot() : ctx.snapshot || {};
+    const res = snap?.resolution || {};
+    const w = res.width || snap?.w || snap?.width;
+    const h = res.height || snap?.h || snap?.height;
 
-      // nếu found nhưng clicked=false (node không clickable) -> tap vào center bounds
-      if (r?.found && !r?.clicked) {
-        const c = _centerFromBounds(r);
-        if (c) {
-          await agentCallLine(deviceId, { type: "TAP", x: c.x, y: c.y }, 1200);
-          await sleep(220);
-        }
-      } else if (r?.found && r?.clicked) {
-        await sleep(250);
+    if (w && h) {
+      const x = Math.round(w * 0.93);
+
+      // quét từ 0.62 -> 0.88, step 0.04 (ăn mọi layout)
+      const yRatios = [];
+      for (let yr = 0.62; yr <= 0.88; yr += 0.04)
+        yRatios.push(Number(yr.toFixed(2)));
+
+      for (const yr of yRatios) {
+        const y = Math.round(h * yr);
+        await agentCallLine(deviceId, { type: "TAP", x, y }, 1200);
+        tiktokLog("share:tap_probe", { deviceId, x, y, yr });
+
+        await sleep(300);
+        if (await isShareSheetOpen(deviceId)) return true;
       }
-
-      if (await isShareSheetOpen(deviceId)) return true;
     }
-  }
-
-  // Fallback theo viewId (không phải máy nào cũng có, nhưng thêm cũng không hại)
-  const idKeywords = ["share", "Share"];
-  for (const kw of idKeywords) {
-    const r = await agentClickId(deviceId, kw);
-    if (r?.found && (r?.clicked || _centerFromBounds(r))) {
-      if (!r.clicked) {
-        const c = _centerFromBounds(r);
-        if (c)
-          await agentCallLine(deviceId, { type: "TAP", x: c.x, y: c.y }, 1200);
-      }
-      await sleep(250);
-      if (await isShareSheetOpen(deviceId)) return true;
-    }
-  }
+  } catch {}
 
   return false;
+}
+
+async function closeShareSheetIfOpen(ctx) {
+  const deviceId = ctx.deviceId;
+  let open = false;
+  try {
+    open = await isShareSheetOpen(deviceId);
+  } catch {
+    open = false;
+  }
+
+  if (!open) return false;
+
+  await ctx.enqueue(async () => {
+    try {
+      await input.back(deviceId);
+    } catch {}
+  });
+
+  await sleep(140);
+  return true;
 }
 
 async function clickCopyLinkOnShareSheet(ctx) {
@@ -875,6 +1172,24 @@ async function clickCopyLinkOnShareSheet(ctx) {
       if (r?.found && r?.clicked) {
         tiktokLog("copybtn:clicked", { deviceId, kw, attempt });
         return true;
+      }
+    }
+
+    // 1.5) CLICK_DESC (nhiều UI để label ở contentDescription)
+    for (const kw of keywords) {
+      const r = await agentClickDesc(deviceId, kw);
+      if (r?.found && r?.clicked) {
+        tiktokLog("copybtn:clicked_desc", { deviceId, kw, attempt });
+        return true;
+      }
+      if (r?.found && !r?.clicked) {
+        const c = _centerFromBounds(r);
+        if (c) {
+          await agentCallLine(deviceId, { type: "TAP", x: c.x, y: c.y }, 1200);
+          tiktokLog("copybtn:tap_center_desc", { deviceId, kw, attempt });
+          await sleep(180);
+          return true;
+        }
       }
     }
 
@@ -911,49 +1226,52 @@ async function clickCopyLinkOnShareSheet(ctx) {
   return false;
 }
 
-function postJson(urlStr, bodyObj, timeoutMs = 12000) {
-  return new Promise((resolve, reject) => {
-    const u = new URL(urlStr);
-    const data = Buffer.from(JSON.stringify(bodyObj), "utf8");
+async function postJson(urlStr, bodyObj, timeoutMs = 12000) {
+  return new Promise((resolve) => {
+    try {
+      const u = new URL(urlStr);
+      const lib = u.protocol === "https:" ? https : http;
 
-    const mod = u.protocol === "https:" ? https : http;
-
-    const req = mod.request(
-      {
-        protocol: u.protocol,
-        hostname: u.hostname,
-        port: u.port ? Number(u.port) : u.protocol === "https:" ? 443 : 80,
-        path: u.pathname + (u.search || ""),
+      const body = JSON.stringify(bodyObj || {});
+      const opts = {
         method: "POST",
+        hostname: u.hostname,
+        port: u.port || undefined,
+        path: u.pathname + u.search,
         headers: {
           "Content-Type": "application/json",
-          "Content-Length": data.length,
+          "Content-Length": Buffer.byteLength(body),
         },
-        timeout: timeoutMs,
-      },
-      (res) => {
-        let out = "";
-        res.on("data", (d) => (out += d.toString("utf8")));
+      };
+
+      const req = lib.request(opts, (res) => {
+        const chunks = [];
+        res.on("data", (d) => chunks.push(d));
         res.on("end", () => {
+          const out = Buffer.concat(chunks).toString("utf8");
           const code = res.statusCode || 0;
-          // Apps Script often returns 200 even on error; still return body to debug
-          if (code >= 200 && code < 300)
-            return resolve({ ok: true, code, out });
-          resolve({ ok: false, code, out });
+
+          // ✅ Google Apps Script thường trả 302 + Location (redirect sang script.googleusercontent.com)
+          // Nếu coi 302 là fail => queue không pop => push lại => trùng link hàng loạt
+          const hasLocation = !!res.headers?.location;
+          const ok =
+            (code >= 200 && code < 300) ||
+            (code >= 300 && code < 400 && hasLocation);
+
+          resolve({ ok, code, out });
         });
-      }
-    );
+      });
 
-    req.on("timeout", () => {
-      try {
+      req.on("error", (e) => resolve({ ok: false, code: 0, out: String(e) }));
+      req.setTimeout(timeoutMs, () => {
         req.destroy(new Error("timeout"));
-      } catch {}
-    });
+      });
 
-    req.on("error", (e) => reject(e));
-
-    req.write(data);
-    req.end();
+      req.write(body);
+      req.end();
+    } catch (e) {
+      resolve({ ok: false, code: 0, out: String(e) });
+    }
   });
 }
 
@@ -1005,6 +1323,15 @@ function enqueueLink(item) {
 }
 
 async function flushQueueIfNeeded(force = false) {
+  tiktokLog("flush:check", {
+    force,
+    running: tiktok.running,
+    qlen: tiktok.queue.length,
+    lastFlushAt: tiktok.lastFlushAt,
+    batchSize: tiktokConfig.batchSize,
+    flushEveryMs: tiktokConfig.flushEveryMs,
+  });
+
   if (tiktok.flushing) return;
   if (!tiktok.running && !force) return;
 
@@ -1060,6 +1387,11 @@ async function flushQueueIfNeeded(force = false) {
       }
 
       if (ok) {
+        tiktokLog("push:ok", {
+          deviceId: it.deviceId,
+          url: maskUrl(it.url, 120),
+        });
+
         tiktok.pushedCount++;
         // remove 1 from front (exact item)
         tiktok.queue.shift();
@@ -1102,7 +1434,7 @@ function startFlushTimer() {
     () => {
       flushQueueIfNeeded(false).catch(() => {});
     },
-    Math.max(1500, Number(tiktokConfig.flushEveryMs) || 15000)
+    Math.max(1500, Number(tiktokConfig.flushEveryMs) || 15000),
   );
 }
 
@@ -1113,220 +1445,336 @@ function stopFlushTimer() {
   }
 }
 
-async function swipeNext(ctx) {
-  const snap = ctx.snapshot?.() || {};
-  const res = snap.resolution || {};
-  const w = res.width || 1080;
-  const h = res.height || 1920;
+async function swipeNext(ctx, opts) {
+  const strong = !!opts?.strong;
+
+  // ctx.snapshot() của bạn đa số là sync, nên gọi kiểu an toàn:
+  const snap =
+    typeof ctx.snapshot === "function" ? ctx.snapshot() : ctx.snapshot || {};
+  const res = snap?.resolution || snap?.res || {};
+  const w = res.width || snap?.w || snap?.width;
+  const h = res.height || snap?.h || snap?.height;
+
+  if (!w || !h) {
+    tiktokLog("swipe:skip_no_resolution", {
+      deviceId: ctx.deviceId,
+      keys: Object.keys(snap || {}).slice(0, 20),
+      hasResolution: !!snap?.resolution,
+    });
+    return;
+  }
+
+  // vuốt thẳng đứng, né cụm icon bên phải + né caption bên trái
   const x = Math.round(w * 0.5);
-  const y1 = Math.round(h * 0.75);
-  const y2 = Math.round(h * 0.25);
-  await input.swipe(ctx.deviceId, x, y1, x, y2, 220);
+  const y1 = Math.round(h * (strong ? 0.9 : 0.82));
+  const y2 = Math.round(h * (strong ? 0.1 : 0.18));
+  const dur = strong ? 420 : 320;
+
+  await input.swipe(ctx.deviceId, x, y1, x, y2, dur);
+
+  tiktokLog("swipe:done", {
+    deviceId: ctx.deviceId,
+    strong,
+    x,
+    y1,
+    y2,
+    dur,
+    w,
+    h,
+  });
 }
 
 async function isLiveScreen(deviceId, cfg) {
   const kws = Array.isArray(cfg.liveKeywords) ? cfg.liveKeywords : [];
+  const minHits = Math.max(1, Number(cfg.liveMinHits) || 2);
+
+  let hit = 0;
   for (const kw of kws) {
     const r = await agentFindText(deviceId, kw);
-    if (r?.found) return true;
+    if (r?.found) {
+      hit++;
+      if (hit >= minHits) return true;
+    }
   }
   return false;
 }
 
 async function runTikTokWorker(deviceId, groupId, macroId) {
-  const ctx = registry.get(deviceId);
-  if (!ctx) return;
+  const ctx0 = registry.get(deviceId);
+  if (!ctx0) return;
 
   const state = tiktok.workers.get(deviceId);
   if (!state) return;
 
   state.stats = state.stats || {};
   state.stats.deviceId = deviceId;
-  state.stats.lastAt = 0;
-  state.stats.ok = 0;
-  state.stats.fail = 0;
-  state.stats.liveSkip = 0;
-  state.stats.liveConsecutive = 0;
-  state.stats.lastUrl = "";
-  state.stats.lastErr = "";
-  state.stats.shareFailStreak = 0;
-
-  // const macro = loadMacroByIdFromStore(macroId);
+  state.stats.ok = state.stats.ok || 0;
+  state.stats.fail = state.stats.fail || 0;
+  state.stats.liveSkip = state.stats.liveSkip || 0;
+  state.stats.liveConsecutive = state.stats.liveConsecutive || 0;
+  state.stats.lastUrl = state.stats.lastUrl || "";
+  state.stats.lastErr = state.stats.lastErr || "";
+  state.stats.shareFailStreak = state.stats.shareFailStreak || 0;
+  state.stats.copyFailStreak = state.stats.copyFailStreak || 0;
 
   tiktokLog("worker:start", { deviceId, groupId, macroId });
 
   while (tiktok.running && !state.stop) {
+    const cfg = tiktokConfig; // ✅ tiktokConfig là OBJECT, không phải function
+
     try {
-      const c = registry.get(deviceId);
-      if (!c || c.state !== "ONLINE") {
+      const ctx = registry.get(deviceId);
+      if (!ctx || ctx.state !== "ONLINE") {
         state.stats.lastErr = "offline";
         await sleep(600);
         continue;
       }
 
-      const snap = c.snapshot?.() || {};
+      const snap = ctx.snapshot?.() || {};
       if (!snap.agentReady) {
         state.stats.lastErr = "agent_not_ready";
         await sleep(650);
         continue;
       }
 
-      // LIVE detect
-      const live = await isLiveScreen(deviceId, tiktokConfig);
+      // ===== LIVE detect =====
+      const live = await isLiveScreen(deviceId, cfg);
       if (live) {
         state.stats.liveSkip++;
         state.stats.liveConsecutive++;
 
-        // swipe away live
-        await c.enqueue(async () => {
-          await swipeNext(c);
+        await ctx.enqueue(async () => {
+          await swipeNext(ctx, { strong: true });
         });
 
-        // if live stuck -> try back/home
-        if (state.stats.liveConsecutive >= tiktokConfig.liveMaxConsecutive) {
+        if (
+          state.stats.liveConsecutive >= (Number(cfg.liveMaxConsecutive) || 3)
+        ) {
           tiktokLog("live:stuck", { deviceId, n: state.stats.liveConsecutive });
-          await c.enqueue(async () => {
-            try {
-              await input.back(deviceId);
-              await sleep(200);
-              await input.back(deviceId);
-              await sleep(200);
-              await swipeNext(c);
-            } catch {}
-          });
           state.stats.liveConsecutive = 0;
+          await closeShareSheetIfOpen(ctx);
+          await sleep(200);
         }
 
         state.stats.lastAt = Date.now();
         safeSend("tiktok:status", buildTikTokStatus());
-        await sleep(Math.max(80, tiktokConfig.loopDelayMs));
+        await sleep(Math.max(80, cfg.loopDelayMs));
         continue;
       }
 
-      // reset live streak
       state.stats.liveConsecutive = 0;
 
-      // baseline clipboard
-      let baseline = "";
+      // ===== Baseline (chỉ để log) =====
+      let baselineUrl = "";
       try {
-        baseline = await agentClipboardGet(deviceId);
-      } catch (e) {
-        state.stats.lastErr = "clipboard_get_failed";
-        await sleep(500);
-        continue;
-      }
-
-      // run macro share->copy
-      // 1) chạy macro: CHỈ mở share sheet (không tap copy link, không swipe)
-      // mở share sheet theo Accessibility (ổn định, không phụ thuộc tọa độ macro)
-      const opened = await openShareSheet(c);
-      tiktokLog("share:open", { deviceId, opened });
-
-      if (!opened) {
-        state.stats.fail++;
-        state.stats.lastErr = "share_not_opened";
-        state.stats.shareFailStreak = (state.stats.shareFailStreak || 0) + 1;
-
-        // thoát overlay nếu bấm nhầm
-        try {
-          await input.back(deviceId);
-        } catch {}
-        await sleep(220);
-
-        // ❗ KHÔNG swipe ngay -> tránh skip hàng loạt video
-        // chỉ swipe khi fail liên tiếp quá 3 lần
-        if (state.stats.shareFailStreak >= 3) {
-          state.stats.shareFailStreak = 0;
-          if (tiktokConfig.swipeAfterEach) {
-            await c.enqueue(async () => {
-              await swipeNext(c);
-            });
-          }
-        } else {
-          // thử lại trên cùng video
-          await sleep(350);
-        }
-
-        state.stats.lastAt = Date.now();
-        safeSend("tiktok:status", buildTikTokStatus());
-        await sleep(Math.max(80, tiktokConfig.loopDelayMs));
-        continue;
-      } else {
-        // mở được share thì reset streak
-        state.stats.shareFailStreak = 0;
-      }
-
-      // 2) click "Sao chép liên kết" bằng Accessibility text (không phụ thuộc vị trí)
-      let clicked = false;
-      try {
-        clicked = await clickCopyLinkOnShareSheet(c);
-        tiktokLog("copybtn:result", { deviceId, clicked });
-      } catch (e) {
-        clicked = false;
-      }
-
-      // 3) confirm clipboard changed + tiktok url
-      let url = "";
-      try {
-        url = await pollClipboardForTikTokUrl(deviceId, baseline, tiktokConfig);
-      } catch (e) {
-        url = "";
-      }
-
-      // 4) đóng share sheet nếu còn đang mở (tránh swipe bị scroll sheet)
-      try {
-        const s1 = await agentFindText(deviceId, "Gửi đến");
-        const s2 = await agentFindText(deviceId, "Send to");
-        if (s1?.found || s2?.found) {
-          await input.back(deviceId);
-          await sleep(120);
-        }
+        const bA = await agentClipboardGet(deviceId).catch(() => "");
+        const bH = hostClipboardGet();
+        baselineUrl = extractTikTokUrl(bA) || extractTikTokUrl(bH) || "";
       } catch {}
 
-      if (url && isTikTokUrl(url)) {
-        const item = {
-          groupId,
+      const maxAttempts = Math.max(1, Number(cfg.copyAttemptsPerVideo) || 1);
+
+      let success = false;
+      let finalUrl = "";
+      let finalStatus = "";
+      let failReason = "";
+      let forceSwipe = false;
+
+      for (let attempt = 1; attempt <= maxAttempts && !success; attempt++) {
+        tiktokLog("sm:begin", {
           deviceId,
-          url,
-          tsClientMs: Date.now(),
-          hash: sha1(url),
-          meta: {
-            note: "TikTokHarvest",
-          },
-        };
-
-        enqueueLink(item);
-        state.stats.ok++;
-        state.stats.lastUrl = url;
-        state.stats.lastErr = "";
-        tiktokLog("copy:ok", { deviceId, url: url.slice(0, 120) });
-
-        // flush maybe
-        await flushQueueIfNeeded(false);
-      } else {
-        state.stats.fail++;
-        state.stats.lastErr = "copy_not_confirmed";
-        tiktokLog("copy:fail", { deviceId });
-
-        // attempt to close share sheet if stuck
-        await c.enqueue(async () => {
-          try {
-            await input.back(deviceId);
-          } catch {}
+          attempt,
+          baseline: maskUrl(baselineUrl, 80),
         });
+
+        // OPEN_SHARE
+        let opened = false;
+        try {
+          opened = await openShareSheet(ctx);
+        } catch {
+          opened = false;
+        }
+        tiktokLog("sm:share", { deviceId, attempt, opened });
+
+        if (!opened) {
+          state.stats.shareFailStreak++;
+          failReason = "share_not_opened";
+          await closeShareSheetIfOpen(ctx);
+          await sleep(220);
+
+          // nếu fail liên tục -> force swipe mạnh để thoát slideshow/kẹt UI
+          if (
+            state.stats.shareFailStreak >= (Number(cfg.swipeOnFailAfter) || 1)
+          ) {
+            forceSwipe = true;
+          }
+          continue;
+        } else {
+          state.stats.shareFailStreak = 0;
+        }
+
+        // CLICK_COPY + WAIT_CLIPBOARD (mutex)
+        let clicked = false;
+        let w = null;
+
+        await withClipboardMutex(async () => {
+          const baseA = await agentClipboardGet(deviceId).catch(() => "");
+          const baseH = hostClipboardGet();
+
+          try {
+            clicked = await clickCopyLinkOnShareSheet(ctx);
+          } catch {
+            clicked = false;
+          }
+          tiktokLog("sm:copybtn", { deviceId, attempt, clicked });
+
+          // ✅ gọi đúng signature positional
+          w = await waitClipboardTikTokUrlAny(
+            deviceId,
+            baseA,
+            baseH,
+            cfg,
+          ).catch((e) => ({
+            ok: false,
+            status: "error",
+            reason: String(e?.message || e || ""),
+          }));
+        });
+
+        await closeShareSheetIfOpen(ctx);
+
+        // ✅ chỉ success khi status === "ok" và có url
+        if (w?.ok && w.status === "ok" && w.url) {
+          tiktokLog("sm:clipboard:ok", {
+            deviceId,
+            attempt,
+            status: w.status,
+            elapsedMs: w.elapsedMs,
+            tries: w.tries,
+            url: maskUrl(w.url, 120),
+          });
+
+          success = true;
+          finalUrl = w.url || "";
+          finalStatus = w.status || "ok";
+          failReason = "";
+        } else {
+          tiktokLog("sm:clipboard:fail", {
+            deviceId,
+            attempt,
+            status: w?.status || "fail",
+            reason:
+              w?.reason ||
+              (w?.status === "dup"
+                ? "same_as_baseline"
+                : clicked
+                  ? "clipboard_timeout"
+                  : "copybtn_not_clicked"),
+            elapsedMs: w?.elapsedMs || 0,
+            tries: w?.tries || 0,
+          });
+
+          success = false;
+          finalUrl = "";
+          finalStatus = w?.status || "timeout";
+          failReason =
+            w?.reason ||
+            (w?.status === "dup"
+              ? "same_as_baseline"
+              : clicked
+                ? "clipboard_timeout"
+                : "copybtn_not_clicked");
+
+          // nếu dup/timeout liên tục -> force swipe mạnh
+          if (w?.status === "dup" || w?.status === "timeout") {
+            forceSwipe = true;
+          }
+        }
+
+        if (!success) await sleep(240);
       }
 
-      // swipe next
-      if (tiktokConfig.swipeAfterEach) {
-        await c.enqueue(async () => {
-          await swipeNext(c);
+      // ===== ENQUEUE / DEDUPE =====
+      if (success && finalUrl && isTikTokUrl(finalUrl)) {
+        const url = extractTikTokUrl(finalUrl) || String(finalUrl || "").trim();
+
+        if (url && url === state.stats.lastUrl) {
+          tiktokLog("copy:dup", {
+            deviceId,
+            url: maskUrl(url, 120),
+            status: finalStatus,
+          });
+          // dup_same_as_last => coi như fail để swipe mạnh thoát kẹt
+          state.stats.fail++;
+          state.stats.lastErr = "dup_same_as_last";
+          state.stats.copyFailStreak++;
+          forceSwipe = true;
+        } else {
+          const item = {
+            groupId,
+            deviceId,
+            url,
+            tsClientMs: Date.now(),
+            hash: sha1(url),
+            meta: { note: "TikTokHarvest" },
+          };
+
+          enqueueLink(item); // ✅ persist queue
+          state.stats.ok++;
+          state.stats.lastUrl = url;
+          state.stats.lastErr = "";
+          state.stats.copyFailStreak = 0;
+
+          tiktokLog("copy:ok", {
+            deviceId,
+            url: maskUrl(url, 120),
+            status: finalStatus,
+          });
+          await flushQueueIfNeeded(false);
+        }
+      } else {
+        state.stats.fail++;
+        state.stats.lastErr = failReason || "copy_not_confirmed";
+        state.stats.copyFailStreak++;
+
+        tiktokLog("copy:fail", {
+          deviceId,
+          reason: state.stats.lastErr,
+          baseline: maskUrl(baselineUrl, 80),
+          failStreak: state.stats.copyFailStreak,
         });
+
+        await closeShareSheetIfOpen(ctx);
+      }
+
+      // ===== SWIPE policy =====
+      const swipeOnFailAfter = Math.max(1, Number(cfg.swipeOnFailAfter) || 1);
+      const shouldSwipe =
+        !!cfg.swipeAfterEach &&
+        (success ||
+          forceSwipe ||
+          state.stats.copyFailStreak >= swipeOnFailAfter);
+
+      if (shouldSwipe) {
+        await ctx.enqueue(async () => {
+          await swipeNext(ctx, { strong: forceSwipe });
+        });
+
+        tiktokLog("sm:swipe", {
+          deviceId,
+          strong: !!forceSwipe,
+          success,
+          failStreak: state.stats.copyFailStreak,
+        });
+
+        if (!success) state.stats.copyFailStreak = 0;
+      } else {
+        await sleep(300);
       }
 
       state.stats.lastAt = Date.now();
       safeSend("tiktok:status", buildTikTokStatus());
-
-      await sleep(Math.max(40, tiktokConfig.loopDelayMs));
+      await sleep(Math.max(40, cfg.loopDelayMs));
     } catch (e) {
       state.stats.fail++;
       state.stats.lastErr = String(e?.message || e || "");
@@ -1367,6 +1815,10 @@ async function tiktokStartRuntime({ groupId, macroId, configPatch }) {
   tiktok.queue = loadQueueFromDisk();
 
   tiktok.running = true;
+  tiktok.lastFlushAt = 0;
+  tiktok.pushedCount = 0;
+  tiktok.failCount = 0;
+
   tiktok.startedAt = Date.now();
   tiktok.groupId = gid;
   tiktok.macroId = mid;
@@ -1392,7 +1844,12 @@ async function tiktokStartRuntime({ groupId, macroId, configPatch }) {
 
   // run in background (still in same process)
   for (const did of ids) {
-    runTikTokWorker(did, gid, mid).catch(() => {});
+    runTikTokWorker(did, gid, mid).catch((e) => {
+      tiktokLog("worker:spawn_error", {
+        deviceId: did,
+        err: String(e?.message || e || "").slice(0, 200),
+      });
+    });
     await sleep(120);
   }
 }
@@ -1436,7 +1893,7 @@ app.whenReady().then(() => {
   if (saved && typeof saved === "object") {
     setDeviceOrder(saved.deviceOrder || []);
     layoutConfig.scalePct = normalizeScalePct(
-      saved.scalePct ?? layoutConfig.scalePct
+      saved.scalePct ?? layoutConfig.scalePct,
     );
     layoutConfig.cols = clampInt(saved.cols ?? layoutConfig.cols, 1, 20);
     layoutConfig.rows = clampInt(saved.rows ?? layoutConfig.rows, 0, 20);
@@ -1559,7 +2016,7 @@ app.whenReady().then(() => {
 
     const { width, height, maxSize } = computeScrcpyCellAndMaxSize(
       snap,
-      cfg.scalePct
+      cfg.scalePct,
     );
 
     await scrcpy.start(deviceId, {
@@ -1619,7 +2076,7 @@ app.whenReady().then(() => {
 
         const { width, height, maxSize } = computeScrcpyCellAndMaxSize(
           snap,
-          cfg.scalePct
+          cfg.scalePct,
         );
 
         await scrcpy.start(d.deviceId, {
@@ -1677,7 +2134,7 @@ app.whenReady().then(() => {
 
     const all = registry.listSnapshots();
     const runningOnline = all.filter(
-      (d) => d.state === "ONLINE" && scrcpy.isRunning(d.deviceId)
+      (d) => d.state === "ONLINE" && scrcpy.isRunning(d.deviceId),
     );
 
     const ordered = sortDevicesByOrder(runningOnline);
@@ -1711,7 +2168,7 @@ app.whenReady().then(() => {
         sendToBottom: true,
         noActivate: true,
         timeoutMs: 15000,
-      }
+      },
     );
 
     logger?.audit("scrcpy:applyLayout", { count: items.length, forceResize });
@@ -1850,7 +2307,7 @@ app.whenReady().then(() => {
     const running = scrcpy.isRunning(deviceId);
     if (!running)
       throw new Error(
-        "scrcpy is not running for this device. Start scrcpy first."
+        "scrcpy is not running for this device. Start scrcpy first.",
       );
 
     recorder.start({ deviceId, deviceRes: res });
@@ -1868,7 +2325,7 @@ app.whenReady().then(() => {
             s.y1Pct,
             s.x2Pct,
             s.y2Pct,
-            s.durationMs
+            s.durationMs,
           );
       },
     });
@@ -2058,7 +2515,7 @@ app.whenReady().then(() => {
       groupId,
       Number(xPct),
       Number(yPct),
-      opts || {}
+      opts || {},
     );
   });
 
@@ -2081,9 +2538,9 @@ app.whenReady().then(() => {
         Number(x2Pct),
         Number(y2Pct),
         Number(durationMs || 220),
-        opts || {}
+        opts || {},
       );
-    }
+    },
   );
 
   ipcMain.handle("group:swipeDir", async (_, { groupId, dir, opts }) => {
@@ -2125,9 +2582,9 @@ app.whenReady().then(() => {
         groupId,
         macroId,
         options || {},
-        fanoutOpts || {}
+        fanoutOpts || {},
       );
-    }
+    },
   );
 
   ipcMain.handle("group:macroStopGroup", async (_, { groupId }) => {
@@ -2153,10 +2610,10 @@ app.whenReady().then(() => {
 
   ipcMain.handle("tiktok:start", async (_, payload = {}) => {
     const groupId = String(
-      payload.groupId || tiktokConfig.groupId || ""
+      payload.groupId || tiktokConfig.groupId || "",
     ).trim();
     const macroId = String(
-      payload.macroId || tiktokConfig.macroId || ""
+      payload.macroId || tiktokConfig.macroId || "",
     ).trim();
     const configPatch =
       payload.config && typeof payload.config === "object"
